@@ -1,26 +1,134 @@
-#!/bin/sh
+#!/bin/bash
 
-rm -rf ~timezoned/download
-mkdir ~timezoned/download
+# Get the absolute path of the current working directory
+CURRENT_DIR=$(pwd)
 
-rm -rf ~timezoned/zoneinfo
-mkdir ~timezoned/zoneinfo
+# Create or clean directories
+rm -rf "$CURRENT_DIR/download"
+mkdir -p "$CURRENT_DIR/download"
 
-cd ~timezoned/download
+rm -rf "$CURRENT_DIR/zoneinfo"
+mkdir -p "$CURRENT_DIR/zoneinfo"
 
+rm -rf "$CURRENT_DIR/timezones"
+mkdir -p "$CURRENT_DIR/timezones"
+
+# Change to the download directory
+cd "$CURRENT_DIR/download" || exit 1
+
+# Download the latest timezone data
 wget ftp://ftp.iana.org/tz/tzdata-latest.tar.gz
+
+# Extract the timezone data archive
 tar zxvf tzdata-latest.tar.gz
 rm tzdata-latest.tar.gz
-for i in `ls`; do zic -d ~timezoned/zoneinfo $i;done
 
-rm ~timezoned/posixinfo
-
-cd ~timezoned/zoneinfo
-for i in `find *|grep /`
-do
-	if [ -f $i ]; then
-		echo -n $i  >> ~timezoned/posixinfo
-		echo -n " " >> ~timezoned/posixinfo
-		tail -1 $i  >> ~timezoned/posixinfo
-	fi
+# Compile timezone data files in the correct order
+for file in africa antarctica asia australasia europe northamerica southamerica etcetera backward; do
+    INPUT_FILE="$CURRENT_DIR/download/$file"
+    if [ -f "$INPUT_FILE" ]; then
+        echo "Compiling $file with zic..."
+        zic -d "$CURRENT_DIR/zoneinfo" "$INPUT_FILE"
+    else
+        echo "Warning: Expected timezone data file '$file' not found."
+    fi
 done
+
+# Remove existing posixinfo file
+rm -f "$CURRENT_DIR/posixinfo"
+
+# Generate the posixinfo file
+cd "$CURRENT_DIR/zoneinfo" || exit 1
+for i in $(find . -type f); do
+    echo -n "${i#./} " >> "$CURRENT_DIR/posixinfo"  # Strip the leading './' from the path
+    tail -1 "$i" >> "$CURRENT_DIR/posixinfo"
+done
+
+# Extract timezones from zone1970.tab and create JSON files
+cd "$CURRENT_DIR" || exit 1
+ZONE_FILE="$CURRENT_DIR/download/zone1970.tab"
+
+if [ -f "$ZONE_FILE" ]; then
+    echo "Processing available timezones from zone1970.tab..."
+
+    # Create dictionaries to store regions and their subregions
+    declare -A REGIONS
+    declare -A SUBREGIONS
+
+    # Read the zone1970.tab file
+    while read -r line; do
+        # Skip comments
+        [[ "$line" =~ ^# ]] && continue
+
+        # Extract timezone (3rd column in zone1970.tab)
+        TZ=$(echo "$line" | awk '{print $3}')
+
+        # Split into components
+        IFS="/" read -r REGION SUBREGION EXTRA <<< "$TZ"
+
+        # Populate dictionaries
+        if [ -z "$SUBREGION" ]; then
+            # No subregion means top-level region only
+            REGIONS["$REGION"]+=""
+        else
+            # We have at least one subregion
+            REGIONS["$REGION"]+="$SUBREGION,"
+            # If there's an extra level, it's a sub-subregion
+            if [ -n "$EXTRA" ]; then
+                SUBREGIONS["$SUBREGION"]+="$EXTRA,"
+            fi
+        fi
+    done < "$ZONE_FILE"
+
+    # Write the main JSON file for regions
+    {
+        echo "["
+        REGION_COUNT=0
+        REGION_TOTAL=${#REGIONS[@]}
+        for REGION in "${!REGIONS[@]}"; do
+            REGION_COUNT=$((REGION_COUNT + 1))
+            REGION_SUBREGIONS_CLEAN=$(echo "${REGIONS[$REGION]}" | sed 's/,$//')
+            REGION_SUBREGION_COUNT=$(echo "$REGION_SUBREGIONS_CLEAN" | tr ',' '\n' | grep -c '^.')
+
+            if [ "$REGION_COUNT" -eq "$REGION_TOTAL" ]; then
+                echo "  { \"name\": \"$REGION\", \"count\": $REGION_SUBREGION_COUNT }"
+            else
+                echo "  { \"name\": \"$REGION\", \"count\": $REGION_SUBREGION_COUNT },"
+            fi
+
+            # Create region JSON files
+            REGION_FILE="$CURRENT_DIR/timezones/${REGION}.json"
+            echo "[" > "$REGION_FILE"
+
+            # Add subregions to each region file
+            SUBREGIONS_LIST=$(echo "$REGION_SUBREGIONS_CLEAN" | tr ',' '\n' | sort | uniq)
+            for SUB in $SUBREGIONS_LIST; do
+                if [ -n "$SUB" ]; then
+                    SUB_CLEAN=$(echo "${SUBREGIONS[$SUB]}" | sed 's/,$//')
+                    SUB_COUNT=$(echo "$SUB_CLEAN" | tr ',' '\n' | grep -c '^.')
+
+                    echo "  { \"name\": \"$SUB\", \"count\": $SUB_COUNT }," >> "$REGION_FILE"
+
+                    # Create subregion JSON files for sub-sub-regions if they exist
+                    if [ -n "${SUBREGIONS[$SUB]}" ]; then
+                        SUBREGION_FILE="$CURRENT_DIR/timezones/${SUB}.json"
+                        echo "[" > "$SUBREGION_FILE"
+                        SUBSUBREGIONS=$(echo "$SUB_CLEAN" | tr ',' '\n' | sort | uniq)
+                        for SUBSUB in $SUBSUBREGIONS; do
+                            if [ -n "$SUBSUB" ]; then
+                                echo "  \"$SUBSUB\"," >> "$SUBREGION_FILE"
+                            fi
+                        done
+                        sed -i '$ s/,$//' "$SUBREGION_FILE"  # Remove trailing comma
+                        echo "]" >> "$SUBREGION_FILE"
+                    fi
+                fi
+            done
+            sed -i '$ s/,$//' "$REGION_FILE"  # Remove trailing comma
+            echo "]" >> "$REGION_FILE"
+        done
+        echo "]"
+    } > "$CURRENT_DIR/timezones/regions.json"
+fi
+
+echo "Timezone files created in $CURRENT_DIR/timezones"

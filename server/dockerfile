@@ -1,0 +1,35 @@
+# Use a lightweight PHP base image
+FROM php:cli
+
+# Set working directory
+WORKDIR /app
+
+# Copy the server and update scripts explicitly
+COPY ./server /app/server
+COPY ./update /app/update
+
+# Install necessary dependencies and cron
+RUN apt-get update && apt-get install -y \
+    tzdata \
+    wget \
+    tar \
+    geoip-bin \
+    && docker-php-ext-install sockets \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set the timezone and port environment variable
+ENV TZ=UTC
+ENV UDP_PORT=2342
+
+# Make the scripts executable
+RUN chmod +x /app/update /app/server
+
+# Run the update script during build
+RUN /app/update
+
+# Expose UDP port 2342
+EXPOSE ${UDP_PORT}/udp
+
+# Start both cron and the server script
+CMD ["sh", "-c", "php /app/server"]

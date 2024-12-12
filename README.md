@@ -2,7 +2,13 @@
 
 # ezTime, an Arduino library for all of time&nbsp;<sup>*</sup>
 
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <sup>written&nbsp;by&nbsp;Rop&nbsp;Gonggrijp</sup>
+ezTime2 is a fork of the original ezTime library created by Rop Gonggrijp, which has been an invaluable resource for handling time-related tasks in Arduino projects. I want to extend my heartfelt thanks to Rop for his amazing work. I have been using the ezTime library for years and absolutely love its simplicity and functionality.
+
+This repository is my attempt to take the original ezTime library further by introducing improvements, updates, or features that align with my personal needs and ideas. As of now, ezTime2 is more of a personal project and may not yet be suitable for general use. While I cannot recommend it as a stable replacement for the original library, this may change as the project evolves.
+
+If you have stumbled upon this repository, feel free to explore it and provide feedback, but please note that this project is still a work in progress. For a stable and reliable time library, I encourage you to use the original ezTime by Rop Gonggrijp.
+
+Stay tuned for updates as ezTime2 grows and matures!
 
 **ezTime &mdash; pronounced "Easy Time" &mdash; is a very easy to use Arduino time and date library that provides NTP network time lookups, extensive timezone support, formatted time and date strings, user events, millisecond precision and more.**
 

@@ -74,7 +74,7 @@ def reassemble_chunks(sock, first_packet):
 
 def main():
     print("UDP Client for Server Testing")
-    print("Type your requests below (e.g., Asia_json, Europe/Berlin, GB, GEOIP). Type 'exit' to quit.")
+    print("Type your requests below (e.g., Asia.json, Europe/Berlin, GB, GEOIP). Type 'exit' to quit.")
 
     # Create UDP socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

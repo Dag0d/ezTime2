@@ -102,18 +102,30 @@ while (1) {
     $logstart = date("D, d M Y H:i:s") . "Z -- $remote_ip:$remote_port --";
 
     // Check for JSON file request
-    if (preg_match('/^(.*?)_json$/i', $query, $matches)) {
-        $json_file_name = $matches[1] . '.json'; // Use the exact case as in the query
-        $json_file_path = $base_dir . '/timezones/' . $json_file_name;
+    if (preg_match('/^(.*?)\.json$/i', $query, $matches)) {
+        $requested_file = strtolower($matches[1] . '.json');
+        $dir_path = $base_dir . '/timezones/';
 
-        if (file_exists($json_file_path)) {
+        // Find file case-insensitively
+        $files = scandir($dir_path);
+        $json_file_name = null;
+
+        foreach ($files as $file) {
+            if (strtolower($file) === $requested_file) {
+                $json_file_name = $file;
+                break;
+            }
+        }
+
+        if ($json_file_name) {
             echo "$logstart Serving $json_file_name\n";
+            $json_file_path = $dir_path . $json_file_name;
             $json_data = file_get_contents($json_file_path);
 
             // Split the response into smaller chunks with metadata
             $chunks = str_split($json_data, $max_packet_size - 50); // Reserve space for metadata
             $total_chunks = count($chunks);
-            
+
             foreach ($chunks as $index => $chunk) {
                 $metadata = json_encode([
                     'total' => $total_chunks,
@@ -124,7 +136,7 @@ while (1) {
                 socket_sendto($sock, $packet, strlen($packet), 0, $remote_ip, $remote_port);
             }
         } else {
-            echo "$logstart ERR JSON FILE NOT FOUND: $json_file_name\n";
+            echo "$logstart ERR JSON FILE NOT FOUND: $requested_file\n";
             socket_sendto($sock, "ERROR JSON File Not Found", 100, 0, $remote_ip, $remote_port);
         }
         continue;

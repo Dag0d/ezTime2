@@ -2,6 +2,9 @@
 
 <?php
 
+// Set PHP timezone based on the container's TZ environment variable
+date_default_timezone_set(getenv('TZ') ?: 'UTC');
+
 // Determine the base directory of the script
 $base_dir = dirname(__FILE__);
 

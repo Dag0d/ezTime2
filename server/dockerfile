@@ -1,25 +1,34 @@
-# Use a lightweight PHP base image
+# Use latest stable PHP CLI image
 FROM php:cli
 
 # Set working directory
 WORKDIR /app
 
-# Copy the server and update scripts explicitly
-COPY ./server /app/server
-COPY ./update /app/update
-
-# Install necessary dependencies and cron
+# Install necessary dependencies
 RUN apt-get update && apt-get install -y \
     tzdata \
     wget \
     tar \
     geoip-bin \
+    netcat-openbsd \
     && docker-php-ext-install sockets \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Set the port environment variable
+# Copy the server and update scripts explicitly
+COPY ./server /app/server
+COPY ./update /app/update
+
+# Environment variables with default values
 ENV UDP_PORT=2342
+ENV RATE_LIMITING_ENABLED=true
+ENV GEOIP_API_HOST=geoip-api
+ENV GEOIP_API_PORT=8080
+ENV TZ=UTC
+
+# Set the tzdata version environment variable
+ARG VERSION
+ENV TZDATA_VERSION=${VERSION}
 
 # Make the scripts executable
 RUN chmod +x /app/update /app/server
@@ -27,8 +36,16 @@ RUN chmod +x /app/update /app/server
 # Run the update script during build
 RUN /app/update
 
-# Expose UDP port 2342
+# Copy health check script
+COPY ./healthcheck.sh /app/healthcheck.sh
+RUN chmod +x /app/healthcheck.sh
+
+# Expose UDP port
 EXPOSE ${UDP_PORT}/udp
 
-# Start both cron and the server script
-CMD ["sh", "-c", "php /app/server"]
+# Add health check - test every 30 seconds with longer start period
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD /app/healthcheck.sh || exit 1
+
+# Start the server script
+CMD ["php", "/app/server"]

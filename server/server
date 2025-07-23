@@ -69,7 +69,7 @@ if ($file = fopen($posixinfo_path, "r")) {
     while (!feof($file)) {
         $line = fgets($file);
         if (preg_match("/^(.*?) (.*?)$/", $line, $matches) && trim($matches[1]) !== "" && trim($matches[2]) !== "") {
-            $tz[] = array("olsen" => trim($matches[1]), "posix" => trim($matches[2]));
+            $tz[] = array("olson" => trim($matches[1]), "posix" => trim($matches[2]));
         }
     }
     fclose($file);
@@ -89,7 +89,7 @@ if ($file = fopen($zone1970_path, "r")) {
                     $insert_at = -1;
                     $posix = "";
                     for ($m = 0; $m < count($tz); $m++) {
-                        if (trim($tz[$m]["olsen"]) == trim($columns[2])) {
+                        if (trim($tz[$m]["olson"]) == trim($columns[2])) {
                             $posix = $tz[$m]["posix"];
                             if (!isset($tz[$m]["country"])) {
                                 $insert_at = $m;
@@ -102,7 +102,7 @@ if ($file = fopen($zone1970_path, "r")) {
                     }
                     $tz[$insert_at]["country"] = $country;
                     $tz[$insert_at]["coordinates"] = $columns[1];
-                    $tz[$insert_at]["olsen"] = trim($columns[2]);
+                    $tz[$insert_at]["olson"] = trim($columns[2]);
                     if ($posix != "") {
                         $tz[$insert_at]["posix"] = $posix;
                     }
@@ -122,7 +122,7 @@ echo "Data read \n";
 // Performance Optimization: Create indexes for faster lookups
 // ------------------------
 $country_index = array();
-$olsen_index = array();
+$olson_index = array();
 
 foreach ($tz as $index => $entry) {
     // Index by country code for faster country lookups
@@ -133,13 +133,13 @@ foreach ($tz as $index => $entry) {
         $country_index[$entry["country"]][] = $index;
     }
     
-    // Index by uppercase Olsen name for faster string searches
-    if (isset($entry["olsen"])) {
-        $olsen_upper = strtoupper($entry["olsen"]);
-        if (!isset($olsen_index[$olsen_upper])) {
-            $olsen_index[$olsen_upper] = array();
+    // Index by uppercase olson name for faster string searches
+    if (isset($entry["olson"])) {
+        $olson_upper = strtoupper($entry["olson"]);
+        if (!isset($olson_index[$olson_upper])) {
+            $olson_index[$olson_upper] = array();
         }
-        $olsen_index[$olsen_upper][] = $index;
+        $olson_index[$olson_upper][] = $index;
     }
 }
 
@@ -149,13 +149,13 @@ echo "Indexes created for " . count($tz) . " timezones\n";
 // Wrapper functions that use indexes
 // ------------------------
 function handleCountryQueryWithIndex($query, $tz) {
-    global $country_index, $olsen_index;
-    return handleCountryQuery($query, $tz, $country_index, $olsen_index);
+    global $country_index, $olson_index;
+    return handleCountryQuery($query, $tz, $country_index, $olson_index);
 }
 
 function handleStringQueryWithIndex($query, $tz) {
-    global $olsen_index;
-    return handleStringQuery($query, $tz, $olsen_index);
+    global $olson_index;
+    return handleStringQuery($query, $tz, $olson_index);
 }
 
 // ------------------------
@@ -164,7 +164,7 @@ function handleStringQueryWithIndex($query, $tz) {
 function getCountryCodeFromTimezone($timezone_name, $tz) {
     // Search through timezone data to find country code for this timezone
     foreach ($tz as $entry) {
-        if (isset($entry['olsen']) && $entry['olsen'] === $timezone_name) {
+        if (isset($entry['olson']) && $entry['olson'] === $timezone_name) {
             if (isset($entry['country'])) {
                 return $entry['country'];
             }
@@ -213,7 +213,7 @@ function sendChunks($data, $max_packet_size, $sock, $remote_ip, $remote_port) {
  * @param string   $queryForProcessing   The query passed to the processor.
  * @param string   $logQuery       The query string used in logs (can include extra info such as IP).
  * @param callable $processor      A callback function that accepts ($query, $tz) and returns:
- *                                   - On success: an associative array with keys 'olsen' and 'posix'
+ *                                   - On success: an associative array with keys 'olson' and 'posix'
  *                                   - On failure: false, or an array with an 'error' key ('not_found', 'multiple', or 'internal')
  * @param array    $tz             Timezone data array.
  * @param resource $sock           The UDP socket.
@@ -245,8 +245,8 @@ function processAndRespond($origin, $queryForProcessing, $logQuery, $processor, 
         }
         return;
     }
-    echo "$logstart OK $origin: $logQuery -> " . $result['olsen'] . " " . $result['posix'] . "\n";
-    $response = "OK " . $result['olsen'] . " " . $result['posix'];
+    echo "$logstart OK $origin: $logQuery -> " . $result['olson'] . " " . $result['posix'] . "\n";
+    $response = "OK " . $result['olson'] . " " . $result['posix'];
     if (!socket_sendto($sock, $response, strlen($response), 0, $remote_ip, $remote_port)) {
         error_log("Failed to send response to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
     }
@@ -308,14 +308,14 @@ function handleGetip($remote_ip) {
 // Country Query: For a two-letter country code, apply adjustments and lookup.
 // For "DE" or "IE", delegate to handleStringQuery with the corresponding Olson value.
 // For "UK", convert to "GB". Otherwise, search for a unique match in $tz.
-// On success, returns ['olsen'=>..., 'posix'=>...]. On error, returns an array with key 'error' set to 'not_found' or 'multiple'.
-function handleCountryQuery($query, $tz, $country_index, $olsen_index = null) {
+// On success, returns ['olson'=>..., 'posix'=>...]. On error, returns an array with key 'error' set to 'not_found' or 'multiple'.
+function handleCountryQuery($query, $tz, $country_index, $olson_index = null) {
     $upper = strtoupper($query);
     if ($upper === "DE") {
-        return handleStringQuery("EUROPE/BERLIN", $tz, $olsen_index);
+        return handleStringQuery("EUROPE/BERLIN", $tz, $olson_index);
     }
     if ($upper === "IE") {
-        return handleStringQuery("EUROPE/DUBLIN", $tz, $olsen_index);
+        return handleStringQuery("EUROPE/DUBLIN", $tz, $olson_index);
     }
     if ($upper === "UK") {
         $upper = "GB";
@@ -331,37 +331,37 @@ function handleCountryQuery($query, $tz, $country_index, $olsen_index = null) {
     
     if ($num_matches === 1) {
         $entry = $tz[$matches[0]];
-        return array('olsen' => $entry['olsen'], 'posix' => $entry['posix']);
+        return array('olson' => $entry['olson'], 'posix' => $entry['posix']);
     } else {
         return array('error' => 'multiple');
     }
 }
 
 // String Query: Searches for time zones matching the query (substring search on Olson).
-// Returns an associative array with keys 'olsen' and 'posix', or false.
-function handleStringQuery($query, $tz, $olsen_index = null) {
+// Returns an associative array with keys 'olson' and 'posix', or false.
+function handleStringQuery($query, $tz, $olson_index = null) {
     $query_upper = strtoupper($query);
     
     // Try exact match first if index is available
-    if ($olsen_index !== null && isset($olsen_index[$query_upper])) {
-        $entry = $tz[$olsen_index[$query_upper][0]];
+    if ($olson_index !== null && isset($olson_index[$query_upper])) {
+        $entry = $tz[$olson_index[$query_upper][0]];
         $posix = $entry["posix"];
-        $olsen = $entry["olsen"];
-        if ($olsen == "Europe/Dublin") {  // Special case.
+        $olson = $entry["olson"];
+        if ($olson == "Europe/Dublin") {  // Special case.
             $posix = "GMT0IST,M3.5.0/1,M10.5.0";
         }
-        return array('olsen' => $olsen, 'posix' => $posix);
+        return array('olson' => $olson, 'posix' => $posix);
     }
     
     // Fallback to substring search for partial matches
     foreach ($tz as $entry) {
-        if (strpos(strtoupper($entry["olsen"]), $query_upper) !== false) {
+        if (strpos(strtoupper($entry["olson"]), $query_upper) !== false) {
             $posix = $entry["posix"];
-            $olsen = $entry["olsen"];
-            if ($olsen == "Europe/Dublin") {  // Special case.
+            $olson = $entry["olson"];
+            if ($olson == "Europe/Dublin") {  // Special case.
                 $posix = "GMT0IST,M3.5.0/1,M10.5.0";
             }
-            return array('olsen' => $olsen, 'posix' => $posix);
+            return array('olson' => $olson, 'posix' => $posix);
         }
     }
     return false;
@@ -558,7 +558,7 @@ function handleInfo($query, $remote_ip, $tz) {
         $geoip_data = $geoip_result;
         
         foreach ($tz as $entry) {
-            if (isset($entry['olsen']) && $entry['olsen'] === $timezone_name) {
+            if (isset($entry['olson']) && $entry['olson'] === $timezone_name) {
                 $posix_string = $entry['posix'];
                 break;
             }
@@ -568,7 +568,7 @@ function handleInfo($query, $remote_ip, $tz) {
         $timezone_name = $target;
         
         foreach ($tz as $entry) {
-            if (isset($entry['olsen']) && $entry['olsen'] === $timezone_name) {
+            if (isset($entry['olson']) && $entry['olson'] === $timezone_name) {
                 $posix_string = $entry['posix'];
                 break;
             }

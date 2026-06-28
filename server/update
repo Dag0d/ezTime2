@@ -114,7 +114,7 @@ if [ -f "$ZONE_FILE" ]; then
         for REGION in "${!REGIONS[@]}"; do
             REGION_COUNT=$((REGION_COUNT + 1))
             REGION_SUBREGIONS_CLEAN=$(echo "${REGIONS[$REGION]}" | sed 's/,$//')
-            REGION_SUBREGION_COUNT=$(echo "$REGION_SUBREGIONS_CLEAN" | tr ',' '\n' | grep -c '^.')
+            REGION_SUBREGION_COUNT=$(echo "$REGION_SUBREGIONS_CLEAN" | tr ',' '\n' | awk 'NF { count++ } END { print count + 0 }')
 
             echo "$REGION:$REGION_SUBREGION_COUNT;"
 
@@ -127,7 +127,7 @@ if [ -f "$ZONE_FILE" ]; then
                 if [ -n "$SUB" ]; then
                     CURRENT_SUBREGIONS="${SUBREGIONS[$SUB]-}"
                     SUB_CLEAN=$(echo "$CURRENT_SUBREGIONS" | sed 's/,$//')
-                    SUB_COUNT=$(echo "$SUB_CLEAN" | tr ',' '\n' | grep -c '^.')
+                    SUB_COUNT=$(echo "$SUB_CLEAN" | tr ',' '\n' | awk 'NF { count++ } END { print count + 0 }')
 
                     echo "$SUB:$SUB_COUNT;" >> "$REGION_FILE"
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.0.2 - 2026-06-28
+
+- fixed `EXT_GEOIP` parsing for HTTP services that respond with `Transfer-Encoding: chunked`
+- improved `EXT_GEOIP` error logging with upstream status and JSON/body diagnostics
+
 ## 3.0.1 - 2026-06-28
 
 - fixed `LIST` challenge follow-up requests being counted by the rate limiter

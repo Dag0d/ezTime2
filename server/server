@@ -311,6 +311,51 @@ function validateListChallengeToken($token, $query, $request_id, $remote_ip) {
     return hash_equals($expected_hash, $provided_hash);
 }
 
+function getHttpHeaderValue($headers, $name) {
+    if (preg_match('/^' . preg_quote($name, '/') . ':\s*(.+)$/mi', $headers, $matches)) {
+        return trim($matches[1]);
+    }
+    return null;
+}
+
+function decodeChunkedHttpBody($body) {
+    $decoded = '';
+    $offset = 0;
+    $body_length = strlen($body);
+
+    while (true) {
+        $line_end = strpos($body, "\r\n", $offset);
+        if ($line_end === false) {
+            return false;
+        }
+
+        $length_line = trim(substr($body, $offset, $line_end - $offset));
+        $length_line = explode(';', $length_line, 2)[0];
+        if ($length_line === '' || !ctype_xdigit($length_line)) {
+            return false;
+        }
+
+        $chunk_length = hexdec($length_line);
+        $offset = $line_end + 2;
+
+        if ($chunk_length === 0) {
+            return $decoded;
+        }
+
+        if (($offset + $chunk_length + 2) > $body_length) {
+            return false;
+        }
+
+        $decoded .= substr($body, $offset, $chunk_length);
+        $offset += $chunk_length;
+
+        if (substr($body, $offset, 2) !== "\r\n") {
+            return false;
+        }
+        $offset += 2;
+    }
+}
+
 // ------------------------
 // Wrapper functions that use indexes
 // ------------------------
@@ -581,15 +626,35 @@ function handleExtGeoip($query, $remote_ip) {
     }
 
     if (!preg_match('#^HTTP/\d+\.\d+\s+200\b#', $headers)) {
-        error_log("EXT_GEOIP: Non-200 response for IP $ip");
+        $status_line = strtok($headers, "\r\n");
+        error_log("EXT_GEOIP: Non-200 response for IP $ip from $geoip_host:$geoip_port - $status_line");
         return false;
     }
 
+    $transfer_encoding = getHttpHeaderValue($headers, 'Transfer-Encoding');
+    if ($transfer_encoding !== null && stripos($transfer_encoding, 'chunked') !== false) {
+        $decoded_body = decodeChunkedHttpBody($body);
+        if ($decoded_body === false) {
+            error_log("EXT_GEOIP: Failed to decode chunked response for IP $ip from $geoip_host:$geoip_port");
+            return false;
+        }
+        $body = $decoded_body;
+    }
+
     $geoData = json_decode($body, true);
-    if ($geoData && isset($geoData["timezone"])) {
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        $preview = substr($body, 0, 200);
+        error_log("EXT_GEOIP: JSON decode failed for IP $ip from $geoip_host:$geoip_port - " . json_last_error_msg() . " -- body preview: " . $preview);
+        return false;
+    }
+
+    if (is_array($geoData) && isset($geoData["timezone"]) && is_string($geoData["timezone"]) && $geoData["timezone"] !== '') {
         cacheSet($ext_geoip_cache, $cache_key, $geoData, $geoip_cache_max_entries);
         return $geoData;
     }
+
+    $keys = is_array($geoData) ? implode(',', array_keys($geoData)) : gettype($geoData);
+    error_log("EXT_GEOIP: Response missing timezone for IP $ip from $geoip_host:$geoip_port - keys/type: $keys");
     return false;
 }
 

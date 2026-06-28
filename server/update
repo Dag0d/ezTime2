@@ -125,13 +125,14 @@ if [ -f "$ZONE_FILE" ]; then
             SUBREGIONS_LIST=$(echo "$REGION_SUBREGIONS_CLEAN" | tr ',' '\n' | sort | uniq)
             for SUB in $SUBREGIONS_LIST; do
                 if [ -n "$SUB" ]; then
-                    SUB_CLEAN=$(echo "${SUBREGIONS[$SUB]}" | sed 's/,$//')
+                    CURRENT_SUBREGIONS="${SUBREGIONS[$SUB]-}"
+                    SUB_CLEAN=$(echo "$CURRENT_SUBREGIONS" | sed 's/,$//')
                     SUB_COUNT=$(echo "$SUB_CLEAN" | tr ',' '\n' | grep -c '^.')
 
                     echo "$SUB:$SUB_COUNT;" >> "$REGION_FILE"
 
                     # Create subregion .lst files for sub-sub-regions if they exist
-                    if [ -n "${SUBREGIONS[$SUB]}" ]; then
+                    if [ -n "$CURRENT_SUBREGIONS" ]; then
                         SUBREGION_FILE="$CURRENT_DIR/timezones/${SUB}.lst"
                         SUBSUBREGIONS=$(echo "$SUB_CLEAN" | tr ',' '\n' | sort | uniq)
                         for SUBSUB in $SUBSUBREGIONS; do

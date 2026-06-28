@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Get the absolute path of the current working directory
 CURRENT_DIR=$(pwd)
@@ -16,8 +17,34 @@ mkdir -p "$CURRENT_DIR/timezones"
 # Change to the download directory
 cd "$CURRENT_DIR/download" || exit 1
 
-# Download the latest timezone data
-wget ftp://ftp.iana.org/tz/tzdata-latest.tar.gz
+# Download the timezone data over HTTPS
+TZDATA_VERSION="${VERSION:-${TZDATA_VERSION:-}}"
+TZDATA_BASE_URL="https://data.iana.org/time-zones"
+VERIFY_TZDATA_SIGNATURE="${VERIFY_TZDATA_SIGNATURE:-true}"
+TZDATA_GPG_KEY="${TZDATA_GPG_KEY:-ED97E90E62AA7E34}"
+
+if [ -z "$TZDATA_VERSION" ]; then
+    TZDATA_VERSION="$(wget -qO- "${TZDATA_BASE_URL}/tzdb/version")"
+fi
+
+TZDATA_URL="${TZDATA_BASE_URL}/releases/tzdata${TZDATA_VERSION}.tar.gz"
+TZDATA_SIG_URL="${TZDATA_URL}.asc"
+
+echo "Downloading timezone data from ${TZDATA_URL}"
+wget -O tzdata-latest.tar.gz "$TZDATA_URL"
+if [ "$VERIFY_TZDATA_SIGNATURE" = "true" ]; then
+    echo "Downloading timezone data signature from ${TZDATA_SIG_URL}"
+    wget -O tzdata-latest.tar.gz.asc "$TZDATA_SIG_URL"
+
+    export GNUPGHOME
+    GNUPGHOME="$(mktemp -d)"
+    chmod 700 "$GNUPGHOME"
+    trap 'rm -rf "$GNUPGHOME"' EXIT
+
+    gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "$TZDATA_GPG_KEY"
+    gpg --batch --verify tzdata-latest.tar.gz.asc tzdata-latest.tar.gz
+    rm tzdata-latest.tar.gz.asc
+fi
 
 # Extract the timezone data archive
 tar zxvf tzdata-latest.tar.gz

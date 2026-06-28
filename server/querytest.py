@@ -1,5 +1,7 @@
 import socket
 import urllib.request
+import uuid
+import zlib
 
 # Server configuration
 server_addr = "timezoned.circuitflow.eu"  # Replace with your server's address
@@ -11,90 +13,151 @@ max_retries = 3                          # Number of retries for missing chunks
 externalGeoLookup = False   # Enable (True) or disable (False) external geo lookup
 externalIPLookup = True    # Enable (True) or disable (False) external IP lookup fallback
 
+def attach_request_id(query):
+    """Attach a request ID to the outgoing query."""
+    request_id = uuid.uuid4().hex[:12]
+    if "#" in query:
+        return f"{query}&rid={request_id}", request_id
+    return f"{query}#rid={request_id}", request_id
+
+def attach_token(query, token):
+    """Attach a challenge token to the outgoing query."""
+    if "#" in query:
+        return f"{query}&token={token}"
+    return f"{query}#token={token}"
+
 def send_query(sock, query):
     """Send a query to the server."""
     sock.sendto(query.encode(), (server_addr, server_port))
     print(f"Query sent: {query}")
 
-def receive_response(sock):
+def parse_chunk_packet(response):
+    """Parse old and new chunk packet formats."""
+    if not (response.startswith("<") and response.endswith(">") and "|" in response):
+        return None
+
+    packet = response[1:-1]
+    metadata_str, chunk = packet.split("|", 1)
+
+    if metadata_str.startswith("RID="):
+        metadata = {}
+        for entry in metadata_str.split(";"):
+            if "=" not in entry:
+                continue
+            key, value = entry.split("=", 1)
+            metadata[key] = value
+
+        try:
+            total_chunks = int(metadata["TOT"])
+            current_chunk = int(metadata["IDX"])
+            chunk_len = int(metadata["LEN"])
+        except (KeyError, ValueError):
+            return None
+
+        return {
+            "rid": metadata.get("RID"),
+            "total": total_chunks,
+            "index": current_chunk,
+            "length": chunk_len,
+            "crc": metadata.get("CRC", "").lower(),
+            "chunk": chunk,
+        }
+
+    total_str, current_str = metadata_str.split(":")
+    return {
+        "rid": None,
+        "total": int(total_str),
+        "index": int(current_str),
+        "length": len(chunk),
+        "crc": None,
+        "chunk": chunk,
+    }
+
+def receive_response(sock, request_id=None):
     """Receive the full response from the server."""
     try:
         data, addr = sock.recvfrom(buffer_size)
         response = data.decode()
-        
-        # Check if response follows our chunk protocol:
-        # It should start with '<', end with '>', and contain a '|' separator.
-        if response.startswith("<") and response.endswith(">") and "|" in response:
+
+        chunk_info = parse_chunk_packet(response)
+        if chunk_info is not None:
+            if request_id and chunk_info["rid"] and chunk_info["rid"] != request_id:
+                print(f"Ignoring chunk for different request ID: {chunk_info['rid']}")
+                return None
             print("\nResponse is split into multiple chunks.")
-            return reassemble_chunks(sock, response)
+            return reassemble_chunks(sock, chunk_info, request_id)
         else:
-            # Otherwise, return response as-is.
             return response
     except socket.timeout:
         print("Timeout reached while waiting for response.")
         return None
 
-def reassemble_chunks(sock, first_packet):
+def reassemble_chunks(sock, first_chunk_info, request_id=None):
     """
     Reassemble a multi-chunk response.
-    Packet format: <total:current|chunk_data>
-    For example, a packet might look like: <5:1|Adak:0;...>
+    Supports both <total:current|chunk_data> and
+    <RID=id;TOT=n;IDX=i;LEN=len;CRC=crc32|chunk_data>.
     """
     chunks = {}
-    # Remove start (<) and end (>) symbols.
-    packet = first_packet.strip()
-    if packet.startswith("<") and packet.endswith(">"):
-        packet = packet[1:-1]
-    else:
-        print("Invalid packet format.")
+    total_chunks = first_chunk_info["total"]
+    expected_request_id = first_chunk_info["rid"] or request_id
+
+    if first_chunk_info["length"] != len(first_chunk_info["chunk"]):
+        print("Invalid first chunk length.")
         return None
 
-    try:
-        # Split the packet into metadata and data.
-        metadata_str, chunk = packet.split("|", 1)
-        total_str, current_str = metadata_str.split(":")
-        total_chunks = int(total_str)
-        current_chunk = int(current_str)
-        print(f"Expecting {total_chunks} chunks...")
-        chunks[current_chunk] = chunk
-        print(f"Received chunk {current_chunk}/{total_chunks}...")
-
-        # Continue receiving until all chunks are received.
-        while len(chunks) < total_chunks:
-            try:
-                data, addr = sock.recvfrom(buffer_size)
-                packet = data.decode().strip()
-                if packet.startswith("<") and packet.endswith(">"):
-                    packet = packet[1:-1]
-                else:
-                    print("Invalid packet format received.")
-                    continue
-                metadata_str, chunk = packet.split("|", 1)
-                total_str, current_str = metadata_str.split(":")
-                total_chunks_received = int(total_str)
-                current_chunk = int(current_str)
-                if total_chunks_received != total_chunks:
-                    print("Inconsistent total chunks received.")
-                    return None
-                if current_chunk not in chunks:
-                    chunks[current_chunk] = chunk
-                    print(f"Received chunk {current_chunk}/{total_chunks}...")
-            except socket.timeout:
-                print("Timeout reached while receiving chunks.")
-                break
-
-        missing_chunks = set(range(1, total_chunks + 1)) - set(chunks.keys())
-        if missing_chunks:
-            print(f"Missing chunks: {sorted(missing_chunks)}")
+    if first_chunk_info["crc"] is not None:
+        first_crc = zlib.crc32(first_chunk_info["chunk"].encode()) & 0xFFFFFFFF
+        if f"{first_crc:08x}" != first_chunk_info["crc"]:
+            print("CRC mismatch in first chunk.")
             return None
 
-        print("All chunks received. Reassembling response...")
-        full_response = "".join(chunks[i] for i in range(1, total_chunks + 1))
-        return full_response
+    print(f"Expecting {total_chunks} chunks...")
+    chunks[first_chunk_info["index"]] = first_chunk_info["chunk"]
+    print(f"Received chunk {first_chunk_info['index']}/{total_chunks}...")
 
-    except Exception as e:
-        print(f"Error during chunk reassembly: {e}")
+    while len(chunks) < total_chunks:
+        try:
+            data, addr = sock.recvfrom(buffer_size)
+            packet = data.decode().strip()
+            chunk_info = parse_chunk_packet(packet)
+            if chunk_info is None:
+                print("Invalid packet format received.")
+                continue
+
+            if expected_request_id and chunk_info["rid"] and chunk_info["rid"] != expected_request_id:
+                print(f"Ignoring chunk for different request ID: {chunk_info['rid']}")
+                continue
+
+            if chunk_info["total"] != total_chunks:
+                print("Inconsistent total chunks received.")
+                return None
+
+            if chunk_info["length"] != len(chunk_info["chunk"]):
+                print(f"Invalid length for chunk {chunk_info['index']}.")
+                return None
+
+            if chunk_info["crc"] is not None:
+                actual_crc = zlib.crc32(chunk_info["chunk"].encode()) & 0xFFFFFFFF
+                if f"{actual_crc:08x}" != chunk_info["crc"]:
+                    print(f"CRC mismatch in chunk {chunk_info['index']}.")
+                    return None
+
+            if chunk_info["index"] not in chunks:
+                chunks[chunk_info["index"]] = chunk_info["chunk"]
+                print(f"Received chunk {chunk_info['index']}/{total_chunks}...")
+        except socket.timeout:
+            print("Timeout reached while receiving chunks.")
+            break
+
+    missing_chunks = set(range(1, total_chunks + 1)) - set(chunks.keys())
+    if missing_chunks:
+        print(f"Missing chunks: {sorted(missing_chunks)}")
         return None
+
+    print("All chunks received. Reassembling response...")
+    full_response = "".join(chunks[i] for i in range(1, total_chunks + 1))
+    return full_response
 
 def get_external_ip():
     """Retrieve external IP address using a public API via urllib."""
@@ -108,12 +171,19 @@ def get_external_ip():
 
 def execute_query(query, sock):
     """Send query with retries and return response."""
+    base_query, request_id = attach_request_id(query)
+    query_with_id = base_query
     retry_count = 0
     while retry_count < max_retries:
-        send_query(sock, query)
+        send_query(sock, query_with_id)
         print("Waiting for server response...")
-        response = receive_response(sock)
+        response = receive_response(sock, request_id=request_id)
         if response:
+            if response.startswith("LIST CHALLENGE "):
+                token = response[len("LIST CHALLENGE "):].strip()
+                print(f"Received LIST challenge token: {token}")
+                query_with_id = attach_token(base_query, token)
+                continue
             return response
         else:
             retry_count += 1
@@ -246,13 +316,24 @@ def loadtest():
                 
                 try:
                     # Send query
-                    sock.sendto(query.encode(), (server_addr, server_port))
+                    base_query, request_id = attach_request_id(query)
+                    sock.sendto(base_query.encode(), (server_addr, server_port))
                     stats['sent'] += 1
                     
                     # Try to receive response
                     try:
-                        data, addr = sock.recvfrom(buffer_size)
-                        response = data.decode()
+                        response = receive_response(sock, request_id=request_id)
+                        if response and response.startswith("LIST CHALLENGE "):
+                            token = response[len("LIST CHALLENGE "):].strip()
+                            challenged_query = attach_token(base_query, token)
+                            sock.sendto(challenged_query.encode(), (server_addr, server_port))
+                            stats['sent'] += 1
+                            response = receive_response(sock, request_id=request_id)
+
+                        if response is None:
+                            stats['timeouts'] += 1
+                            time.sleep(delay)
+                            continue
                         stats['received'] += 1
                         
                         # Print some responses for monitoring

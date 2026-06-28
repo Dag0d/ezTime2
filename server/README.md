@@ -21,6 +21,15 @@ The Timezoned Server is a high-performance UDP-based service that provides compr
 - **Values:** `true` or `false`
 - **Example:** `RATE_LIMITING_ENABLED=false` (for load testing)
 
+### Global protection limits
+- `GLOBAL_LIMIT_WINDOW` - shared time window for global limits in seconds, default `1`
+- `GLOBAL_REQUEST_LIMIT` - maximum total requests per window, default `500`
+- `GLOBAL_LIST_LIMIT` - maximum `LIST` requests per window, default `30`
+- `GLOBAL_EXT_GEOIP_LIMIT` - maximum `EXT_GEOIP` requests per window, default `30`
+- `GLOBAL_GEOIP_LIMIT` - maximum `GEOIP` requests per window, default `100`
+- `GLOBAL_INFO_ALL_LIMIT` - maximum `INFO all` requests per window, default `100`
+- `RATE_LIMIT_TRACKER_MAX_ENTRIES` - maximum stored per-IP/global limiter entries, default `10000`
+
 ### GEOIP_API_HOST
 - **Default:** `geoip-api`
 - **Description:** Hostname/IP of external GeoIP API service
@@ -30,6 +39,19 @@ The Timezoned Server is a high-performance UDP-based service that provides compr
 - **Default:** `8080`
 - **Description:** Port of external GeoIP API service
 - **Example:** `GEOIP_API_PORT=8080`
+
+### GeoIP cache and safety
+- `GEOIP_CACHE_TTL` - cache TTL for `GEOIP` and `EXT_GEOIP` lookups in seconds, default `86400`
+- `GEOIP_CACHE_MAX_ENTRIES` - maximum cached lookup entries, default `10000`
+- `GEOIP_LOOKUP_TIMEOUT` - timeout for local `geoiplookup`, default `2`
+- `GEOIP_API_TIMEOUT` - timeout for external GeoIP HTTP requests, default `2`
+- `GEOIP_API_HEADER_LIMIT` - maximum accepted HTTP header size in bytes, default `8192`
+- `GEOIP_API_BODY_LIMIT` - maximum accepted HTTP body size in bytes, default `65536`
+
+### LIST protocol hardening
+- `LIST_CHUNK_SIZE` - payload bytes per UDP chunk, default `768`
+- `LIST_CHALLENGE_WINDOW` - challenge token validity window in seconds, default `60`
+- `LIST_CHALLENGE_SECRET` - HMAC secret for stateless list challenges
 
 ### TZ
 - **Default:** `UTC`
@@ -96,25 +118,28 @@ Response: 192.168.1.100
 #### Available Lists
 ```
 Query: LIST regions
+Response: LIST CHALLENGE <token>
+
+Query: LIST regions#rid=abc123&token=<token>
 Response: (Chunked) All available regions
 
 Query: LIST europe
-Response: (Chunked) All European timezones
+Response: (Chunked) Direct European timezone entries
 
 Query: LIST america
-Response: (Chunked) All American timezones
+Response: (Chunked) American subregions such as New_York, Chicago, Denver
 
 Query: LIST asia
-Response: (Chunked) All Asian timezones
+Response: (Chunked) Direct Asian timezone entries
 
 Query: LIST africa
-Response: (Chunked) All African timezones
+Response: (Chunked) Direct African timezone entries
 
 Query: LIST oceania
-Response: (Chunked) All Oceania timezones
+Response: (Chunked) Region list if present in the generated dataset
 
 Query: LIST antarctica
-Response: (Chunked) All Antarctica timezones
+Response: (Chunked) Direct Antarctic timezone entries
 ```
 
 ### 5. INFO Queries - Detailed Timezone Information
@@ -196,12 +221,18 @@ Response: OK FULL ALL_TESTS_PASSED
 ERROR Timezone Not Found
 ERROR Country Not Found
 ERROR Country Spans Multiple Timezones
+ERROR Server Busy
 ERROR GEOIP Lookup Failed
 ERROR GEOIP Internal IP
+ERROR GEOIP Rate Limited
 ERROR EXT_GEOIP Failed
 ERROR EXT_GEOIP Internal IP
+ERROR EXT_GEOIP Rate Limited
+ERROR INFO Rate Limited
 ERROR INFO Invalid infotype: <type>
 ERROR LIST Missing list name
+ERROR LIST Missing request id
+ERROR LIST Rate Limited
 ERROR LST File Not Found
 ERROR HEALTHCHECK Access denied
 ```
@@ -218,7 +249,12 @@ ERROR HEALTHCHECK Access denied
 
 ### LIST Responses
 - Chunked format with metadata
-- Format: `<total>:<current>|<data>`
+- `LIST` uses a stateless challenge/response flow before returning timezone data
+- Extended format with request correlation and integrity check: `<RID=<id>;TOT=<total>;IDX=<current>;LEN=<bytes>;CRC=<crc32>|<data>>`
+- Regions without deeper hierarchy return direct entries with `:0;`
+- Only some top-level regions, such as parts of `America`, produce extra subregion lists
+- `LIST` requests require a request ID in the metadata section of the UDP query, for example `LIST america#rid=abc123`
+- Even single-chunk list responses use the same chunk framing for consistent client handling
 
 ## Performance Characteristics
 

@@ -34,27 +34,79 @@ $udp_port = getenv('UDP_PORT') ?: 2342;
 
 // Maximum UDP packet size.
 $max_packet_size = 1400;
+define('REQUEST_ID_PATTERN', '/^[A-Za-z0-9_-]{1,64}$/');
+
+$list_chunk_payload_size = max(128, min(
+    intval(getenv('LIST_CHUNK_SIZE') ?: 768),
+    $max_packet_size - 96
+));
+
+$list_challenge_window = max(10, intval(getenv('LIST_CHALLENGE_WINDOW') ?: 60));
+$list_challenge_secret = getenv('LIST_CHALLENGE_SECRET') ?: hash('sha256', __FILE__ . php_uname());
+
+$geoip_cache_ttl = max(60, intval(getenv('GEOIP_CACHE_TTL') ?: 86400));
+$geoip_cache_max_entries = max(100, intval(getenv('GEOIP_CACHE_MAX_ENTRIES') ?: 10000));
+
+$rate_limit_tracker_max_entries = max(1000, intval(getenv('RATE_LIMIT_TRACKER_MAX_ENTRIES') ?: 10000));
+$global_limit_window = max(1, intval(getenv('GLOBAL_LIMIT_WINDOW') ?: 1));
+$global_request_limit = max(1, intval(getenv('GLOBAL_REQUEST_LIMIT') ?: 500));
+$global_list_limit = max(1, intval(getenv('GLOBAL_LIST_LIMIT') ?: 30));
+$global_ext_geoip_limit = max(1, intval(getenv('GLOBAL_EXT_GEOIP_LIMIT') ?: 30));
+$global_geoip_limit = max(1, intval(getenv('GLOBAL_GEOIP_LIMIT') ?: 100));
+$global_info_all_limit = max(1, intval(getenv('GLOBAL_INFO_ALL_LIMIT') ?: 100));
+
+$request_windows = array();
+$geoip_cache = array();
+$ext_geoip_cache = array();
 
 // ---------------------------------------------------------
 // Helper: isInternalIP()
-// Checks if the given IP is in a private or loopback range.
+// Checks if the given IP is in a private, loopback, or link-local range.
 function isInternalIP($ip) {
     if (!filter_var($ip, FILTER_VALIDATE_IP)) {
         return false; // Not a valid IP, treat as external.
     }
-    $longIp = ip2long($ip);
-    if ($longIp >= ip2long("10.0.0.0") && $longIp <= ip2long("10.255.255.255")) {
+
+    $packed = @inet_pton($ip);
+    if ($packed === false) {
+        return false;
+    }
+
+    if (strlen($packed) === 4) {
+        $octets = unpack('C4', $packed);
+        if ($octets[1] === 10) return true;
+        if ($octets[1] === 127) return true;
+        if ($octets[1] === 192 && $octets[2] === 168) return true;
+        if ($octets[1] === 172 && $octets[2] >= 16 && $octets[2] <= 31) return true;
+        if ($octets[1] === 169 && $octets[2] === 254) return true;
+        return false;
+    }
+
+    if ($packed === inet_pton('::1')) {
         return true;
     }
-    if ($longIp >= ip2long("172.16.0.0") && $longIp <= ip2long("172.31.255.255")) {
+
+    $bytes = unpack('C16', $packed);
+    $first = $bytes[1];
+    $second = $bytes[2];
+
+    // Unique local addresses fc00::/7
+    if (($first & 0xfe) === 0xfc) {
         return true;
     }
-    if ($longIp >= ip2long("192.168.0.0") && $longIp <= ip2long("192.168.255.255")) {
+
+    // Link-local unicast fe80::/10
+    if ($first === 0xfe && ($second & 0xc0) === 0x80) {
         return true;
     }
-    if ($longIp >= ip2long("127.0.0.0") && $longIp <= ip2long("127.255.255.255")) {
-        return true;
+
+    // IPv4-mapped IPv6 addresses ::ffff:x.x.x.x
+    $ipv4_mapped_prefix = substr($packed, 0, 12);
+    if ($ipv4_mapped_prefix === str_repeat("\x00", 10) . "\xff\xff") {
+        $mapped_ipv4 = inet_ntop(substr($packed, 12, 4));
+        return isInternalIP($mapped_ipv4);
     }
+
     return false;
 }
 
@@ -145,6 +197,120 @@ foreach ($tz as $index => $entry) {
 
 echo "Indexes created for " . count($tz) . " timezones\n";
 
+function trimAssociativeArrayByAge(&$items, $max_entries) {
+    if (count($items) <= $max_entries) {
+        return;
+    }
+
+    uasort($items, function ($a, $b) {
+        $a_time = is_array($a) && isset($a['stored_at']) ? $a['stored_at'] : (is_array($a) && isset($a['timestamp']) ? $a['timestamp'] : $a);
+        $b_time = is_array($b) && isset($b['stored_at']) ? $b['stored_at'] : (is_array($b) && isset($b['timestamp']) ? $b['timestamp'] : $b);
+        return $a_time <=> $b_time;
+    });
+
+    while (count($items) > $max_entries) {
+        array_shift($items);
+    }
+}
+
+function trimMapByOldestValueTimestamp(&$items, $max_entries) {
+    if (count($items) <= $max_entries) {
+        return;
+    }
+
+    uasort($items, function ($a, $b) {
+        $a_time = !empty($a) ? min($a) : 0;
+        $b_time = !empty($b) ? min($b) : 0;
+        return $a_time <=> $b_time;
+    });
+
+    while (count($items) > $max_entries) {
+        array_shift($items);
+    }
+}
+
+function cleanupCacheEntries(&$cache, $ttl, $max_entries) {
+    $now = getUTCTime();
+    foreach ($cache as $key => $entry) {
+        if (!isset($entry['stored_at']) || ($now - $entry['stored_at']) > $ttl) {
+            unset($cache[$key]);
+        }
+    }
+    trimAssociativeArrayByAge($cache, $max_entries);
+}
+
+function cacheGet(&$cache, $key, $ttl, $max_entries) {
+    cleanupCacheEntries($cache, $ttl, $max_entries);
+    if (!isset($cache[$key])) {
+        return null;
+    }
+    if ((getUTCTime() - $cache[$key]['stored_at']) > $ttl) {
+        unset($cache[$key]);
+        return null;
+    }
+    return $cache[$key]['value'];
+}
+
+function cacheSet(&$cache, $key, $value, $max_entries) {
+    $cache[$key] = array(
+        'stored_at' => getUTCTime(),
+        'value' => $value
+    );
+    trimAssociativeArrayByAge($cache, $max_entries);
+}
+
+function allowGlobalRate($bucket, $limit, $window_seconds) {
+    global $request_windows, $rate_limit_tracker_max_entries;
+
+    $now = getUTCTime();
+    if (!isset($request_windows[$bucket])) {
+        $request_windows[$bucket] = array();
+    }
+
+    $request_windows[$bucket] = array_values(array_filter(
+        $request_windows[$bucket],
+        function ($timestamp) use ($now, $window_seconds) {
+            return ($now - $timestamp) < $window_seconds;
+        }
+    ));
+
+    if (count($request_windows[$bucket]) >= $limit) {
+        return false;
+    }
+
+    $request_windows[$bucket][] = $now;
+    trimMapByOldestValueTimestamp($request_windows, $rate_limit_tracker_max_entries);
+    return true;
+}
+
+function createListChallengeToken($query, $request_id, $remote_ip) {
+    global $list_challenge_secret, $list_challenge_window;
+
+    $window = intdiv(getUTCTime(), $list_challenge_window);
+    $payload = $remote_ip . '|' . $request_id . '|' . strtolower(trim($query)) . '|' . $window;
+    return $window . '.' . hash_hmac('sha256', $payload, $list_challenge_secret);
+}
+
+function validateListChallengeToken($token, $query, $request_id, $remote_ip) {
+    global $list_challenge_secret, $list_challenge_window;
+
+    if (!preg_match('/^(\d+)\.([a-f0-9]{64})$/', $token, $matches)) {
+        return false;
+    }
+
+    $window = intval($matches[1]);
+    $provided_hash = $matches[2];
+    $current_window = intdiv(getUTCTime(), $list_challenge_window);
+
+    if ($window < ($current_window - 1) || $window > $current_window) {
+        return false;
+    }
+
+    $payload = $remote_ip . '|' . $request_id . '|' . strtolower(trim($query)) . '|' . $window;
+    $expected_hash = hash_hmac('sha256', $payload, $list_challenge_secret);
+    return hash_equals($expected_hash, $provided_hash);
+}
+
 // ------------------------
 // Wrapper functions that use indexes
 // ------------------------
@@ -156,6 +322,13 @@ function handleCountryQueryWithIndex($query, $tz) {
 function handleStringQueryWithIndex($query, $tz) {
     global $olson_index;
     return handleStringQuery($query, $tz, $olson_index);
+}
+
+function resolveTimezoneQuery($query, $tz) {
+    if (preg_match('/^[A-Z]{2}$/', strtoupper($query))) {
+        return handleCountryQueryWithIndex(strtoupper($query), $tz);
+    }
+    return handleStringQueryWithIndex($query, $tz);
 }
 
 // ------------------------
@@ -190,17 +363,66 @@ function getCityFromTimezone($timezone_name) {
 // Helper: sendChunks()
 // ------------------------
 function sendChunks($data, $max_packet_size, $sock, $remote_ip, $remote_port) {
-    $fixed_overhead = 10;
-    $chunk_size = $max_packet_size - $fixed_overhead;
-    $chunks = str_split($data, $chunk_size);
+    sendChunksWithRequestId($data, $max_packet_size, $sock, $remote_ip, $remote_port, null);
+}
+
+function buildChunkPacket($request_id, $total_chunks, $chunk_index, $chunk) {
+    $checksum = hash('crc32b', $chunk);
+    $metadata = "RID=$request_id;TOT=$total_chunks;IDX=$chunk_index;LEN=" . strlen($chunk) . ";CRC=$checksum";
+    return UDP_START . $metadata . "|" . $chunk . UDP_END;
+}
+
+function sendChunksWithRequestId($data, $max_packet_size, $sock, $remote_ip, $remote_port, $request_id = null) {
+    global $list_chunk_payload_size;
+
+    if ($request_id === null || $request_id === '') {
+        if (!socket_sendto($sock, "ERROR LIST Missing request id", 100, 0, $remote_ip, $remote_port)) {
+            error_log("Failed to send LIST request-id error to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
+        }
+        return;
+    }
+
+    $chunks = str_split($data, $list_chunk_payload_size);
     $total_chunks = count($chunks);
     foreach ($chunks as $index => $chunk) {
-        $metadata = $total_chunks . ":" . ($index + 1) . "|";
-        $packet = UDP_START . $metadata . $chunk . UDP_END;
+        $packet = buildChunkPacket($request_id, $total_chunks, $index + 1, $chunk);
         if (!socket_sendto($sock, $packet, strlen($packet), 0, $remote_ip, $remote_port)) {
             error_log("Failed to send chunk " . ($index + 1) . "/$total_chunks to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
         }
     }
+}
+
+function parsePacketEnvelope($packet) {
+    $parts = explode('#', trim($packet), 2);
+    $query = trim($parts[0]);
+    $metadata = array();
+
+    if (count($parts) === 2 && $parts[1] !== '') {
+        foreach (explode('&', $parts[1]) as $item) {
+            if ($item === '') {
+                continue;
+            }
+            $kv = explode('=', $item, 2);
+            if (count($kv) === 2) {
+                $metadata[strtolower(trim($kv[0]))] = trim($kv[1]);
+            }
+        }
+    }
+
+    return array($query, $metadata);
+}
+
+function getRequestIdFromMetadata($metadata) {
+    if (!isset($metadata['rid'])) {
+        return null;
+    }
+
+    $request_id = $metadata['rid'];
+    if (!preg_match(REQUEST_ID_PATTERN, $request_id)) {
+        return null;
+    }
+
+    return $request_id;
 }
 
 // ------------------------
@@ -258,6 +480,8 @@ function processAndRespond($origin, $queryForProcessing, $logQuery, $processor, 
 
 // EXT_GEOIP: Returns full decoded JSON from external service, or an array with error 'internal' if IP is internal, or false if lookup fails.
 function handleExtGeoip($query, $remote_ip) {
+    global $ext_geoip_cache, $geoip_cache_ttl, $geoip_cache_max_entries;
+
     $parts = preg_split('/\s+/', $query);
     $ip = isset($parts[1]) ? $parts[1] : $remote_ip;
     
@@ -270,18 +494,109 @@ function handleExtGeoip($query, $remote_ip) {
     if (isInternalIP($ip)) {
         return array("error" => "internal");
     }
+
+    $cache_key = 'ext:' . $ip;
+    $cached = cacheGet($ext_geoip_cache, $cache_key, $geoip_cache_ttl, $geoip_cache_max_entries);
+    if ($cached !== null) {
+        return $cached;
+    }
     
     // Use environment variables for API configuration
     $geoip_host = getenv('GEOIP_API_HOST') ?: 'geoip-api';
     $geoip_port = getenv('GEOIP_API_PORT') ?: '8080';
-    $curl_cmd = 'curl -s ' . escapeshellarg("http://$geoip_host:$geoip_port/$ip");
-    $result = shell_exec($curl_cmd);
-    $geoData = json_decode($result, true);
-    return ($geoData && isset($geoData["timezone"])) ? $geoData : false;
+    $geoip_timeout = max(1, intval(getenv('GEOIP_API_TIMEOUT') ?: 2));
+    $geoip_header_limit = max(1024, intval(getenv('GEOIP_API_HEADER_LIMIT') ?: 8192));
+    $geoip_body_limit = max(4096, intval(getenv('GEOIP_API_BODY_LIMIT') ?: 65536));
+    $path = '/' . rawurlencode($ip);
+
+    $connection = @fsockopen($geoip_host, intval($geoip_port), $errno, $errstr, $geoip_timeout);
+    if (!$connection) {
+        error_log("EXT_GEOIP: Connection failed to $geoip_host:$geoip_port - [$errno] $errstr");
+        return false;
+    }
+
+    stream_set_timeout($connection, $geoip_timeout);
+
+    $request = "GET $path HTTP/1.1\r\n";
+    $request .= "Host: $geoip_host\r\n";
+    $request .= "Connection: close\r\n\r\n";
+
+    if (fwrite($connection, $request) === false) {
+        fclose($connection);
+        error_log("EXT_GEOIP: Failed to write request for IP $ip");
+        return false;
+    }
+
+    $result = '';
+    $headers = '';
+    $body = '';
+    $header_complete = false;
+    while (!feof($connection)) {
+        $chunk = fread($connection, 4096);
+        if ($chunk === false) {
+            fclose($connection);
+            error_log("EXT_GEOIP: Failed to read response for IP $ip");
+            return false;
+        }
+
+        $result .= $chunk;
+        $meta = stream_get_meta_data($connection);
+        if ($meta['timed_out']) {
+            fclose($connection);
+            error_log("EXT_GEOIP: Request timed out for IP $ip");
+            return false;
+        }
+
+        if (!$header_complete) {
+            $header_end = strpos($result, "\r\n\r\n");
+            if ($header_end !== false) {
+                $headers = substr($result, 0, $header_end);
+                $body = substr($result, $header_end + 4);
+                $header_complete = true;
+                if (strlen($headers) > $geoip_header_limit) {
+                    fclose($connection);
+                    error_log("EXT_GEOIP: Header too large for IP $ip");
+                    return false;
+                }
+            } elseif (strlen($result) > $geoip_header_limit) {
+                fclose($connection);
+                error_log("EXT_GEOIP: Header too large for IP $ip");
+                return false;
+            }
+        } else {
+            $body = substr($result, strlen($headers) + 4);
+        }
+
+        if ($header_complete && strlen($body) > $geoip_body_limit) {
+            fclose($connection);
+            error_log("EXT_GEOIP: Body too large for IP $ip");
+            return false;
+        }
+    }
+    fclose($connection);
+
+    if (!$header_complete) {
+        error_log("EXT_GEOIP: Invalid HTTP response for IP $ip");
+        return false;
+    }
+
+    if (!preg_match('#^HTTP/\d+\.\d+\s+200\b#', $headers)) {
+        error_log("EXT_GEOIP: Non-200 response for IP $ip");
+        return false;
+    }
+
+    $geoData = json_decode($body, true);
+    if ($geoData && isset($geoData["timezone"])) {
+        cacheSet($ext_geoip_cache, $cache_key, $geoData, $geoip_cache_max_entries);
+        return $geoData;
+    }
+    return false;
 }
 
 // GEOIP: Returns the two-letter country code from local geoip lookup, or an array with error 'internal' if IP is internal, or false if lookup fails.
 function handleGeoip($query, $remote_ip) {
+    global $geoip_cache, $geoip_cache_ttl, $geoip_cache_max_entries;
+
     $parts = preg_split('/\s+/', $query);
     $ip = isset($parts[1]) ? $parts[1] : $remote_ip;
     
@@ -294,10 +609,21 @@ function handleGeoip($query, $remote_ip) {
     if (isInternalIP($ip)) {
         return array("error" => "internal");
     }
+
+    $cache_key = 'geo:' . $ip;
+    $cached = cacheGet($geoip_cache, $cache_key, $geoip_cache_ttl, $geoip_cache_max_entries);
+    if ($cached !== null) {
+        return $cached;
+    }
     
     // Escape IP for shell command to prevent injection
-    $result = exec("geoiplookup " . escapeshellarg($ip));
-    return (preg_match("/: ([A-Z]{2}),/", $result, $matches)) ? $matches[1] : false;
+    $geoip_lookup_timeout = max(1, intval(getenv('GEOIP_LOOKUP_TIMEOUT') ?: 2));
+    $result = exec("timeout " . $geoip_lookup_timeout . " geoiplookup " . escapeshellarg($ip));
+    if (preg_match("/: ([A-Z]{2}),/", $result, $matches)) {
+        cacheSet($geoip_cache, $cache_key, $matches[1], $geoip_cache_max_entries);
+        return $matches[1];
+    }
+    return false;
 }
 
 // GETIP: Returns the client's IP address, or false.
@@ -368,142 +694,64 @@ function handleStringQuery($query, $tz, $olson_index = null) {
 }
 
 // ------------------------
-// INFO Function: POSIX DST Parser and Calculator
+// INFO Function
 // ------------------------
 
 $dst_cache = array();
-
-function parsePosixTimezone($posix_string) {
-    if (empty($posix_string)) return false;
-    
-    $result = array('std_name' => '', 'std_offset' => 0, 'dst_name' => '', 'dst_offset' => 0, 'has_dst' => false);
-    
-    $parts = explode(',', $posix_string);
-    $timezone_part = $parts[0];
-    
-    if (preg_match('/^(<[^>]+>|[A-Z]+)([-+]?\d+)(<[^>]+>|[A-Z]+)?([-+]?\d+)?$/', $timezone_part, $matches)) {
-        $result['std_name'] = $matches[1];
-        $result['std_offset'] = intval($matches[2]);
-        
-        if (isset($matches[3]) && !empty($matches[3])) {
-            $result['dst_name'] = $matches[3];
-            $result['has_dst'] = true;
-            // DST offset: if not specified, it's 1 hour ahead (POSIX: 1 hour less)
-            if (isset($matches[4]) && !empty($matches[4])) {
-                $result['dst_offset'] = intval($matches[4]);
-            } else {
-                $result['dst_offset'] = $result['std_offset'] - 1; // 1 hour ahead in real world
-            }
-        }
-    }
-    
-    if (count($parts) >= 3 && $result['has_dst']) {
-        $result['dst_start_rule'] = $parts[1];
-        $result['dst_end_rule'] = $parts[2];
-    }
-    
-    return $result;
-}
-
-function calculateDSTTransitions($posix_data, $year) {
-    if (!$posix_data['has_dst']) return array('start' => null, 'end' => null);
-    
-    $start_date = parseDSTRule($posix_data['dst_start_rule'], $year);
-    $end_date = parseDSTRule($posix_data['dst_end_rule'], $year);
-    
-    return array('start' => $start_date, 'end' => $end_date);
-}
-
-function parseDSTRule($rule, $year) {
-    if (empty($rule)) return null;
-    
-    $time_parts = explode('/', $rule);
-    $rule_part = $time_parts[0];
-    $hour = isset($time_parts[1]) ? intval($time_parts[1]) : 2;
-    
-    if (preg_match('/^M(\d+)\.(\d+)\.(\d+)$/', $rule_part, $matches)) {
-        $month = intval($matches[1]);
-        $week = intval($matches[2]);
-        $day_of_week = intval($matches[3]);
-        
-        return calculateNthWeekday($year, $month, $week, $day_of_week, $hour);
-    }
-    
-    return null;
-}
-
-function calculateNthWeekday($year, $month, $week, $day_of_week, $hour) {
-    // Use UTC-based calculations
-    $first_day = gmmktime(0, 0, 0, $month, 1, $year);
-    $first_weekday = dateUTC('w', $first_day);
-    
-    $days_to_add = ($day_of_week - $first_weekday + 7) % 7;
-    $days_to_add += ($week - 1) * 7;
-    
-    $target_timestamp = gmmktime($hour, 0, 0, $month, 1 + $days_to_add, $year);
-    if (dateUTC('n', $target_timestamp) != $month) {
-        $target_timestamp = gmmktime($hour, 0, 0, $month, 1 + $days_to_add - 7, $year);
-    }
-    
-    return $target_timestamp;
-}
-
-function getCurrentUTCOffset($posix_data, $timestamp = null) {
-    if ($timestamp === null) $timestamp = getUTCTime();
-    if (!$posix_data['has_dst']) return $posix_data['std_offset'];
-    
-    $year = dateUTC('Y', $timestamp);
-    $transitions = calculateDSTTransitions($posix_data, $year);
-    
-    if ($transitions['start'] && $transitions['end']) {
-        if ($timestamp >= $transitions['start'] && $timestamp < $transitions['end']) {
-            return $posix_data['dst_offset'];
-        }
-    }
-    
-    return $posix_data['std_offset'];
-}
-
-function isInDST($posix_data, $timestamp = null) {
-    if ($timestamp === null) $timestamp = getUTCTime();
-    if (!$posix_data['has_dst']) return false;
-    
-    $year = dateUTC('Y', $timestamp);
-    $transitions = calculateDSTTransitions($posix_data, $year);
-    
-    if ($transitions['start'] && $transitions['end']) {
-        return ($timestamp >= $transitions['start'] && $timestamp < $transitions['end']);
-    }
-    
-    return false;
-}
 
 function getTimezoneInfo($timezone_name, $posix_string, $geoip_data = null, $timestamp = null) {
     global $dst_cache;
     
     if ($timestamp === null) $timestamp = getUTCTime();
     
-    $posix_data = parsePosixTimezone($posix_string);
-    if (!$posix_data) return false;
-    
-    $utc_offset = getCurrentUTCOffset($posix_data, $timestamp);
-    $in_dst = isInDST($posix_data, $timestamp);
-    
-    // POSIX offset to real UTC offset: negate the value
-    $real_utc_offset = -$utc_offset;
-    
-    // Calculate local time
-    $local_timestamp = $timestamp + ($real_utc_offset * 3600);
+    try {
+        $timezone = new DateTimeZone($timezone_name);
+    } catch (Exception $e) {
+        return false;
+    }
+
+    $utc_datetime = new DateTime('@' . $timestamp);
+    $utc_datetime->setTimezone(new DateTimeZone('UTC'));
+
+    $local_datetime = new DateTime('@' . $timestamp);
+    $local_datetime->setTimezone($timezone);
+
+    $real_utc_offset = $timezone->getOffset($utc_datetime);
+
+    $offset_sign = ($real_utc_offset >= 0) ? '+' : '-';
+    $offset_abs = abs($real_utc_offset);
+    $offset_hours = intdiv($offset_abs, 3600);
+    $offset_minutes = intdiv($offset_abs % 3600, 60);
+
+    $year = intval($local_datetime->format('Y'));
+    $year_start = gmmktime(0, 0, 0, 1, 1, $year - 1);
+    $year_end = gmmktime(23, 59, 59, 12, 31, $year + 1);
+    $cache_key = $timezone_name . ':' . $year;
+
+    if (!isset($dst_cache[$cache_key])) {
+        $dst_cache[$cache_key] = $timezone->getTransitions($year_start, $year_end);
+    }
+
+    $transitions = $dst_cache[$cache_key];
+    $has_dst = false;
+    foreach ($transitions as $transition) {
+        if (!empty($transition['isdst'])) {
+            $has_dst = true;
+            break;
+        }
+    }
+
+    $in_dst = $local_datetime->format('I') === '1';
     
     $info = array(
         'olson' => $timezone_name,
         'posix' => $posix_string,
-        'utcoffset' => sprintf('%+03d:%02d', intval($real_utc_offset), abs($real_utc_offset * 60) % 60),
-        'hasdst' => $posix_data['has_dst'] ? 'true' : 'false',
+        'utcoffset' => sprintf('%s%02d:%02d', $offset_sign, $offset_hours, $offset_minutes),
+        'hasdst' => $has_dst ? 'true' : 'false',
         'indst' => $in_dst ? 'true' : 'false',
-        'date' => dateUTC('Y-m-d', $local_timestamp),
-        'day' => strtolower(dateUTC('l', $local_timestamp)),
-        'currenttime' => dateUTC('H:i:s', $local_timestamp),
+        'date' => $local_datetime->format('Y-m-d'),
+        'day' => strtolower($local_datetime->format('l')),
+        'currenttime' => $local_datetime->format('H:i:s'),
         'epoch' => $timestamp
     );
     
@@ -565,18 +813,24 @@ function handleInfo($query, $remote_ip, $tz) {
         }
         
     } else {
-        $timezone_name = $target;
-        
-        foreach ($tz as $entry) {
-            if (isset($entry['olson']) && $entry['olson'] === $timezone_name) {
-                $posix_string = $entry['posix'];
-                break;
+        $lookup_result = resolveTimezoneQuery($target, $tz);
+
+        if ($lookup_result === false) {
+            return array('error' => 'Unknown timezone: ' . $target);
+        }
+
+        if (is_array($lookup_result) && isset($lookup_result['error'])) {
+            if ($lookup_result['error'] === 'not_found') {
+                return array('error' => 'Unknown timezone: ' . $target);
             }
+            if ($lookup_result['error'] === 'multiple') {
+                return array('error' => 'Country spans multiple timezones: ' . $target);
+            }
+            return array('error' => 'Failed to resolve timezone: ' . $target);
         }
-        
-        if (!$posix_string) {
-            return array('error' => 'Unknown timezone: ' . $timezone_name);
-        }
+
+        $timezone_name = $lookup_result['olson'];
+        $posix_string = $lookup_result['posix'];
     }
     
     if (!$posix_string) {
@@ -602,7 +856,7 @@ function handleInfo($query, $remote_ip, $tz) {
 // ------------------------
 // handleLstFileRequest
 // ------------------------
-function handleLstFileRequest($query, $base_dir, $max_packet_size, $remote_ip, $remote_port, $sock, $logstart) {
+function handleLstFileRequest($query, $base_dir, $max_packet_size, $remote_ip, $remote_port, $sock, $logstart, $request_id = null) {
     $requested_file = strtolower($query);
     $dir_path = $base_dir . '/timezones/';
     $files = scandir($dir_path);
@@ -617,7 +871,7 @@ function handleLstFileRequest($query, $base_dir, $max_packet_size, $remote_ip, $
         echo "$logstart OK LIST: $lst_file_name\n";
         $lst_file_path = $dir_path . $lst_file_name;
         $lst_data = file_get_contents($lst_file_path);
-        sendChunks($lst_data, $max_packet_size, $sock, $remote_ip, $remote_port);
+        sendChunksWithRequestId($lst_data, $max_packet_size, $sock, $remote_ip, $remote_port, $request_id);
     } else {
         echo "$logstart ERR LIST: $requested_file not found\n";
         if (!socket_sendto($sock, "ERROR LST File Not Found", 100, 0, $remote_ip, $remote_port)) {
@@ -670,7 +924,9 @@ $request_count = 0;
 
 while (1) {
     socket_recvfrom($sock, $packet, 512, 0, $remote_ip, $remote_port);
-    $query = trim($packet);
+    list($query, $packet_metadata) = parsePacketEnvelope($packet);
+    $request_id = getRequestIdFromMetadata($packet_metadata);
+    $request_token = isset($packet_metadata['token']) ? $packet_metadata['token'] : null;
     $logstart = date("D, d M Y H:i:s") . "Z -- $remote_ip:$remote_port --";
 
     // Cleanup old connections every 100 requests
@@ -678,9 +934,6 @@ while (1) {
         cleanupOldConnections($last_ask);
     }
 
-    // Rate limiting (configurable via environment variable)
-    $rate_limiting_enabled = getenv('RATE_LIMITING_ENABLED') !== 'false';
-    
     if ($rate_limiting_enabled) {
         // Determine allowed interval.
         $allowed_interval = (stripos($query, "LIST") === 0) ? 1 : 3;
@@ -688,10 +941,24 @@ while (1) {
             continue;
         }
         $last_ask[$remote_ip] = getUTCTime();
+        trimAssociativeArrayByAge($last_ask, $rate_limit_tracker_max_entries);
+    }
+
+    if (!allowGlobalRate('global', $global_request_limit, $global_limit_window)) {
+        if (!socket_sendto($sock, "ERROR Server Busy", 100, 0, $remote_ip, $remote_port)) {
+            error_log("Failed to send global rate-limit error to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
+        }
+        continue;
     }
 
     // ---------- EXT_GEOIP handling ----------
     if (stripos($query, "EXT_GEOIP") === 0) {
+        if (!allowGlobalRate('ext_geoip', $global_ext_geoip_limit, $global_limit_window)) {
+            if (!socket_sendto($sock, "ERROR EXT_GEOIP Rate Limited", 100, 0, $remote_ip, $remote_port)) {
+                error_log("Failed to send EXT_GEOIP rate-limit error to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
+            }
+            continue;
+        }
         $parts = preg_split('/\s+/', $query);
         $lookupIP = isset($parts[1]) ? $parts[1] : $remote_ip;
         $geoData = handleExtGeoip($query, $remote_ip);
@@ -700,7 +967,6 @@ while (1) {
             if (!socket_sendto($sock, "ERROR EXT_GEOIP Internal IP", 100, 0, $remote_ip, $remote_port)) {
                 error_log("Failed to send EXT_GEOIP error to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
             }
-            unset($last_ask[$remote_ip]);
             continue;
         }
         if ($geoData === false) {
@@ -717,10 +983,34 @@ while (1) {
 
     // ---------- LIST File Request ----------
     if (stripos($query, "LIST") === 0) {
+        if (!allowGlobalRate('list', $global_list_limit, $global_limit_window)) {
+            if (!socket_sendto($sock, "ERROR LIST Rate Limited", 100, 0, $remote_ip, $remote_port)) {
+                error_log("Failed to send LIST rate-limit error to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
+            }
+            continue;
+        }
         $parts = preg_split('/\s+/', $query);
         if (count($parts) >= 2) {
             $list_name = strtolower($parts[1]) . '.lst';
-            handleLstFileRequest($list_name, $base_dir, $max_packet_size, $remote_ip, $remote_port, $sock, $logstart);
+            if ($request_id === null) {
+                echo "$logstart ERR LIST: Missing request id\n";
+                if (!socket_sendto($sock, "ERROR LIST Missing request id", 100, 0, $remote_ip, $remote_port)) {
+                    error_log("Failed to send LIST request-id error to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
+                }
+                continue;
+            }
+
+            if ($request_token === null || !validateListChallengeToken($request_token, $query, $request_id, $remote_ip)) {
+                $challenge = createListChallengeToken($query, $request_id, $remote_ip);
+                $challenge_response = "LIST CHALLENGE " . $challenge;
+                echo "$logstart CHALLENGE LIST: $list_name\n";
+                if (!socket_sendto($sock, $challenge_response, strlen($challenge_response), 0, $remote_ip, $remote_port)) {
+                    error_log("Failed to send LIST challenge to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
+                }
+                continue;
+            }
+
+            handleLstFileRequest($list_name, $base_dir, $max_packet_size, $remote_ip, $remote_port, $sock, $logstart, $request_id);
         } else {
             echo "$logstart ERR LIST: Missing list name\n";
             if (!socket_sendto($sock, "ERROR LIST Missing list name", 100, 0, $remote_ip, $remote_port)) {
@@ -804,6 +1094,12 @@ while (1) {
 
     // ---------- GEOIP handling ----------
     if (stripos($query, "GEOIP") === 0) {
+        if (!allowGlobalRate('geoip', $global_geoip_limit, $global_limit_window)) {
+            if (!socket_sendto($sock, "ERROR GEOIP Rate Limited", 100, 0, $remote_ip, $remote_port)) {
+                error_log("Failed to send GEOIP rate-limit error to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
+            }
+            continue;
+        }
         $parts = preg_split('/\s+/', $query);
         $lookupIP = isset($parts[1]) ? $parts[1] : $remote_ip;
         $countryCode = handleGeoip($query, $remote_ip);
@@ -812,7 +1108,6 @@ while (1) {
             if (!socket_sendto($sock, "ERROR GEOIP Internal IP", 100, 0, $remote_ip, $remote_port)) {
                 error_log("Failed to send GEOIP error to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
             }
-            unset($last_ask[$remote_ip]);
             continue;
         }
         if ($countryCode === false) {
@@ -828,6 +1123,13 @@ while (1) {
 
     // ---------- INFO handling ----------
     if (stripos($query, "INFO") === 0) {
+        $info_is_all = preg_match('/^INFO\s+all(\s|$)/i', $query) === 1;
+        if ($info_is_all && !allowGlobalRate('info_all', $global_info_all_limit, $global_limit_window)) {
+            if (!socket_sendto($sock, "ERROR INFO Rate Limited", 100, 0, $remote_ip, $remote_port)) {
+                error_log("Failed to send INFO rate-limit error to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
+            }
+            continue;
+        }
         $info_result = handleInfo($query, $remote_ip, $tz);
         
         if (isset($info_result['error'])) {
@@ -846,13 +1148,14 @@ while (1) {
         $log_query = "$infotype [$target]";
         
         if ($info_result['success'] === 'all') {
-            // Build all data response - no chunking needed (always < 1400 bytes)
             $all_data = "INFO OK all\n";
             foreach ($info_result['data'] as $key => $value) {
                 $all_data .= $key . ":" . $value . ";\n";
             }
             echo "$logstart OK INFO: $log_query -> all data\n";
-            if (!socket_sendto($sock, $all_data, strlen($all_data), 0, $remote_ip, $remote_port)) {
+            if ($request_id !== null) {
+                sendChunksWithRequestId($all_data, $max_packet_size, $sock, $remote_ip, $remote_port, $request_id);
+            } else if (!socket_sendto($sock, $all_data, strlen($all_data), 0, $remote_ip, $remote_port)) {
                 error_log("Failed to send INFO all response to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
             }
         } else {

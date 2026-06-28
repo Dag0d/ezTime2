@@ -1,5 +1,5 @@
-# Use latest stable PHP CLI image
-FROM php:cli
+# Use the latest PHP 8 CLI image within the major version
+FROM php:8-cli
 
 # Set working directory
 WORKDIR /app
@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y \
     tzdata \
     wget \
     tar \
+    ca-certificates \
+    gnupg \
+    dirmngr \
     geoip-bin \
     netcat-openbsd \
     && docker-php-ext-install sockets \
@@ -24,11 +27,33 @@ ENV UDP_PORT=2342
 ENV RATE_LIMITING_ENABLED=true
 ENV GEOIP_API_HOST=geoip-api
 ENV GEOIP_API_PORT=8080
+ENV GEOIP_API_TIMEOUT=2
+ENV GEOIP_LOOKUP_TIMEOUT=2
+ENV GEOIP_API_HEADER_LIMIT=8192
+ENV GEOIP_API_BODY_LIMIT=65536
+ENV GEOIP_CACHE_TTL=86400
+ENV GEOIP_CACHE_MAX_ENTRIES=10000
+ENV GLOBAL_LIMIT_WINDOW=1
+ENV GLOBAL_REQUEST_LIMIT=500
+ENV GLOBAL_LIST_LIMIT=30
+ENV GLOBAL_EXT_GEOIP_LIMIT=30
+ENV GLOBAL_GEOIP_LIMIT=100
+ENV GLOBAL_INFO_ALL_LIMIT=100
+ENV RATE_LIMIT_TRACKER_MAX_ENTRIES=10000
+ENV LIST_CHUNK_SIZE=768
+ENV LIST_CHALLENGE_WINDOW=60
+ENV VERIFY_TZDATA_SIGNATURE=true
+ENV TZDATA_GPG_KEY=ED97E90E62AA7E34
 ENV TZ=UTC
 
 # Set the tzdata version environment variable
 ARG VERSION
+ARG APP_VERSION=dev
 ENV TZDATA_VERSION=${VERSION}
+
+LABEL org.opencontainers.image.title="timezoned"
+LABEL org.opencontainers.image.version="${APP_VERSION}"
+LABEL org.opencontainers.image.description="UDP timezone server for ezTime"
 
 # Make the scripts executable
 RUN chmod +x /app/update /app/server
@@ -40,12 +65,17 @@ RUN /app/update
 COPY ./healthcheck.sh /app/healthcheck.sh
 RUN chmod +x /app/healthcheck.sh
 
+RUN useradd --system --create-home --home-dir /home/timezoned --shell /usr/sbin/nologin timezoned \
+    && chown -R timezoned:timezoned /app
+
 # Expose UDP port
 EXPOSE ${UDP_PORT}/udp
 
 # Add health check - test every 30 seconds with longer start period
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD /app/healthcheck.sh || exit 1
+
+USER timezoned
 
 # Start the server script
 CMD ["php", "/app/server"]

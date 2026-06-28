@@ -37,7 +37,7 @@ $max_packet_size = 1400;
 define('REQUEST_ID_PATTERN', '/^[A-Za-z0-9_-]{1,64}$/');
 
 $list_chunk_payload_size = max(128, min(
-    intval(getenv('LIST_CHUNK_SIZE') ?: 768),
+    intval(getenv('LIST_CHUNK_SIZE') ?: 512),
     $max_packet_size - 96
 ));
 
@@ -927,6 +927,11 @@ while (1) {
     list($query, $packet_metadata) = parsePacketEnvelope($packet);
     $request_id = getRequestIdFromMetadata($packet_metadata);
     $request_token = isset($packet_metadata['token']) ? $packet_metadata['token'] : null;
+    $is_list_query = stripos($query, "LIST") === 0;
+    $is_valid_list_followup = $is_list_query
+        && $request_id !== null
+        && $request_token !== null
+        && validateListChallengeToken($request_token, $query, $request_id, $remote_ip);
     $logstart = date("D, d M Y H:i:s") . "Z -- $remote_ip:$remote_port --";
 
     // Cleanup old connections every 100 requests
@@ -936,15 +941,17 @@ while (1) {
 
     if ($rate_limiting_enabled) {
         // Determine allowed interval.
-        $allowed_interval = (stripos($query, "LIST") === 0) ? 1 : 3;
-        if (isset($last_ask[$remote_ip]) && $last_ask[$remote_ip] > getUTCTime() - $allowed_interval) {
-            continue;
+        $allowed_interval = $is_list_query ? 1 : 3;
+        if (!$is_valid_list_followup) {
+            if (isset($last_ask[$remote_ip]) && $last_ask[$remote_ip] > getUTCTime() - $allowed_interval) {
+                continue;
+            }
+            $last_ask[$remote_ip] = getUTCTime();
+            trimAssociativeArrayByAge($last_ask, $rate_limit_tracker_max_entries);
         }
-        $last_ask[$remote_ip] = getUTCTime();
-        trimAssociativeArrayByAge($last_ask, $rate_limit_tracker_max_entries);
     }
 
-    if (!allowGlobalRate('global', $global_request_limit, $global_limit_window)) {
+    if (!$is_valid_list_followup && !allowGlobalRate('global', $global_request_limit, $global_limit_window)) {
         if (!socket_sendto($sock, "ERROR Server Busy", 100, 0, $remote_ip, $remote_port)) {
             error_log("Failed to send global rate-limit error to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
         }
@@ -982,8 +989,8 @@ while (1) {
     }
 
     // ---------- LIST File Request ----------
-    if (stripos($query, "LIST") === 0) {
-        if (!allowGlobalRate('list', $global_list_limit, $global_limit_window)) {
+    if ($is_list_query) {
+        if (!$is_valid_list_followup && !allowGlobalRate('list', $global_list_limit, $global_limit_window)) {
             if (!socket_sendto($sock, "ERROR LIST Rate Limited", 100, 0, $remote_ip, $remote_port)) {
                 error_log("Failed to send LIST rate-limit error to $remote_ip:$remote_port - " . socket_strerror(socket_last_error()));
             }
@@ -1000,7 +1007,7 @@ while (1) {
                 continue;
             }
 
-            if ($request_token === null || !validateListChallengeToken($request_token, $query, $request_id, $remote_ip)) {
+            if (!$is_valid_list_followup) {
                 $challenge = createListChallengeToken($query, $request_id, $remote_ip);
                 $challenge_response = "LIST CHALLENGE " . $challenge;
                 echo "$logstart CHALLENGE LIST: $list_name\n";

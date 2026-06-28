@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.0.1 - 2026-06-28
+
+- fixed `LIST` challenge follow-up requests being counted by the rate limiter
+- reduced default `LIST` chunk size from `768` to `512` bytes
+- clarified `querytest.py` chunk output so single-chunk frames are not reported as multi-chunk responses
+
 ## 3.0.0 - 2026-06-28
 
 - rebuilt the timezone server with public-facing hardening in mind

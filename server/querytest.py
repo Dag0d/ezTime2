@@ -84,7 +84,10 @@ def receive_response(sock, request_id=None):
             if request_id and chunk_info["rid"] and chunk_info["rid"] != request_id:
                 print(f"Ignoring chunk for different request ID: {chunk_info['rid']}")
                 return None
-            print("\nResponse is split into multiple chunks.")
+            if chunk_info["total"] > 1:
+                print(f"\nResponse is split into {chunk_info['total']} chunks.")
+            else:
+                print("\nResponse received in a single chunk frame.")
             return reassemble_chunks(sock, chunk_info, request_id)
         else:
             return response
@@ -112,9 +115,11 @@ def reassemble_chunks(sock, first_chunk_info, request_id=None):
             print("CRC mismatch in first chunk.")
             return None
 
-    print(f"Expecting {total_chunks} chunks...")
+    if total_chunks > 1:
+        print(f"Expecting {total_chunks} chunks...")
     chunks[first_chunk_info["index"]] = first_chunk_info["chunk"]
-    print(f"Received chunk {first_chunk_info['index']}/{total_chunks}...")
+    if total_chunks > 1:
+        print(f"Received chunk {first_chunk_info['index']}/{total_chunks}...")
 
     while len(chunks) < total_chunks:
         try:
@@ -145,7 +150,8 @@ def reassemble_chunks(sock, first_chunk_info, request_id=None):
 
             if chunk_info["index"] not in chunks:
                 chunks[chunk_info["index"]] = chunk_info["chunk"]
-                print(f"Received chunk {chunk_info['index']}/{total_chunks}...")
+                if total_chunks > 1:
+                    print(f"Received chunk {chunk_info['index']}/{total_chunks}...")
         except socket.timeout:
             print("Timeout reached while receiving chunks.")
             break
@@ -155,7 +161,8 @@ def reassemble_chunks(sock, first_chunk_info, request_id=None):
         print(f"Missing chunks: {sorted(missing_chunks)}")
         return None
 
-    print("All chunks received. Reassembling response...")
+    if total_chunks > 1:
+        print("All chunks received. Reassembling response...")
     full_response = "".join(chunks[i] for i in range(1, total_chunks + 1))
     return full_response
 

@@ -10,8 +10,8 @@ buffer_size = 1472                       # Should match the server's max packet 
 max_retries = 3                          # Number of retries for missing chunks
 
 # Configuration for external lookup features
-externalGeoLookup = False   # Enable (True) or disable (False) external geo lookup
-externalIPLookup = True    # Enable (True) or disable (False) external IP lookup fallback
+forceExtGeoipQueries = False   # Rewrite GEOIP queries to EXT_GEOIP before sending
+retryWithPublicIp = True       # Retry with the public IP if the server rejects an internal IP
 
 def attach_request_id(query):
     """Attach a request ID to the outgoing query."""
@@ -214,7 +214,7 @@ def main():
 
             # If external geo lookup is enabled and the query starts with "GEOIP", change it to "EXT_GEOIP"
             tokens = query.split(maxsplit=1)
-            if externalGeoLookup and tokens[0] == "GEOIP":
+            if forceExtGeoipQueries and tokens[0] == "GEOIP":
                 new_query = "EXT_GEOIP" + (" " + tokens[1] if len(tokens) > 1 else "")
                 print("External geo lookup is enabled, changing query from GEOIP to EXT_GEOIP.")
                 query = new_query
@@ -228,7 +228,7 @@ def main():
 
             # Handle internal IP error responses
             if response in ("ERROR GEOIP Internal IP", "ERROR EXT_GEOIP Internal IP"):
-                if externalIPLookup:
+                if retryWithPublicIp:
                     print("Received internal IP error from API.")
                     ext_ip = get_external_ip()
                     if ext_ip:

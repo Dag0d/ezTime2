@@ -1,17 +1,17 @@
 {
-  "name": "ezTime",
-  "description": "ezTime - pronounced 'Easy Time' - is a very easy to use Arduino time and date library that provides NTP network time lookups, extensive timezone support, formatted time and date strings, user events, millisecond precision and more.",
+  "name": "ezTime2",
+  "description": "ezTime2 - pronounced 'Easy Time' - is an Arduino time and date library with NTP sync, timezone lookups, formatted output, events, and millisecond precision.",
   "keywords": "time date ntp timezone events milliseconds",
   "authors": {
-    "name": "Rop Gonggrijp",
-    "url": "https://github.com/ropg",
+    "name": "Dag0d",
+    "url": "https://github.com/Dag0d",
     "maintainer": true
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/ropg/ezTime"
+    "url": "https://github.com/Dag0d/ezTime2"
   },
-  "version": "3.0.2",
+  "version": "1.0.0",
   "framework": "arduino",
   "platforms": "*",
   "build": {

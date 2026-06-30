@@ -1,4 +1,4 @@
-#include <ezTime.h>
+#include <ezTime2.h>
 #include <WiFi.h>
 
 void setup() {

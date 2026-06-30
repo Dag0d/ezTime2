@@ -114,7 +114,8 @@ if [ -f "$ZONE_FILE" ]; then
         for REGION in "${!REGIONS[@]}"; do
             REGION_COUNT=$((REGION_COUNT + 1))
             REGION_SUBREGIONS_CLEAN=$(echo "${REGIONS[$REGION]}" | sed 's/,$//')
-            REGION_SUBREGION_COUNT=$(echo "$REGION_SUBREGIONS_CLEAN" | tr ',' '\n' | awk 'NF { count++ } END { print count + 0 }')
+            SUBREGIONS_LIST=$(echo "$REGION_SUBREGIONS_CLEAN" | tr ',' '\n' | awk 'NF' | sort | uniq)
+            REGION_SUBREGION_COUNT=$(printf '%s\n' "$SUBREGIONS_LIST" | awk 'NF { count++ } END { print count + 0 }')
 
             echo "$REGION:$REGION_SUBREGION_COUNT;"
 
@@ -122,19 +123,18 @@ if [ -f "$ZONE_FILE" ]; then
             REGION_FILE="$CURRENT_DIR/timezones/${REGION}.lst"
 
             # Add subregions to each region file
-            SUBREGIONS_LIST=$(echo "$REGION_SUBREGIONS_CLEAN" | tr ',' '\n' | sort | uniq)
             for SUB in $SUBREGIONS_LIST; do
                 if [ -n "$SUB" ]; then
                     CURRENT_SUBREGIONS="${SUBREGIONS[$SUB]-}"
                     SUB_CLEAN=$(echo "$CURRENT_SUBREGIONS" | sed 's/,$//')
-                    SUB_COUNT=$(echo "$SUB_CLEAN" | tr ',' '\n' | awk 'NF { count++ } END { print count + 0 }')
+                    SUBSUBREGIONS=$(echo "$SUB_CLEAN" | tr ',' '\n' | awk 'NF' | sort | uniq)
+                    SUB_COUNT=$(printf '%s\n' "$SUBSUBREGIONS" | awk 'NF { count++ } END { print count + 0 }')
 
                     echo "$SUB:$SUB_COUNT;" >> "$REGION_FILE"
 
                     # Create subregion .lst files for sub-sub-regions if they exist
                     if [ -n "$CURRENT_SUBREGIONS" ]; then
                         SUBREGION_FILE="$CURRENT_DIR/timezones/${SUB}.lst"
-                        SUBSUBREGIONS=$(echo "$SUB_CLEAN" | tr ',' '\n' | sort | uniq)
                         for SUBSUB in $SUBSUBREGIONS; do
                             if [ -n "$SUBSUB" ]; then
                                 echo "$SUBSUB:0;" >> "$SUBREGION_FILE"

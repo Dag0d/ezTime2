@@ -1,11 +1,11 @@
 /* 
- *  Note: to use an ethernet shield, You must also set #define EZTIME_ETHERNET in $sketch_dir/libraries/ezTime/src/ezTime.h
+ *  Note: to use an ethernet shield, add #define EZTIME_ETHERNET to ezTime2Config.h next to your sketch
  *  
  *  Also note that all ezTime examples can be used with an Ethernet shield if you just replace the beginning of the sketch 
  *  with the beginning of this one.
  */
 
-#include <ezTime.h>
+#include <ezTime2.h>
 
 #include <Ethernet.h>
 
@@ -50,6 +50,18 @@ void setup() {
 	Serial.println("UTC:             " + UTC.dateTime());
 
 	Timezone myTZ;
+	myTZ.setGeoLookupMode(GEOIP_LOOKUP_WITH_EXT_FALLBACK);
+
+	String publicIP;
+	if (ezt::getPublicIP(publicIP)) {
+		Serial.print(F("Public IP:       "));
+		Serial.println(publicIP);
+	} else {
+		Serial.print(F("Public IP:       "));
+		Serial.println(errorString());
+	}
+
+	delay(3500);
 
 	// Provide official timezone names
 	// https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
@@ -58,8 +70,8 @@ void setup() {
 	Serial.println(myTZ.dateTime());
 
 	// Wait a little bit to not trigger DDoS protection on server
-	// See https://github.com/ropg/ezTime#timezonedropnl
-	delay(5000);
+	// See https://github.com/Dag0d/ezTime2#timezonedcircuitfloweu
+	delay(3500);
 
 	// Or country codes for countries that do not span multiple timezones
 	myTZ.setLocation(F("de"));
@@ -67,9 +79,9 @@ void setup() {
 	Serial.println(myTZ.dateTime());
 
 	// Same as above
-	delay(5000);
+	delay(3500);
 
-	// See if local time can be obtained (does not work in countries that span multiple timezones)
+	// GeoIP stays the default, but with EXT_GEOIP fallback enabled above.
 	Serial.print(F("Local (GeoIP):   "));
 	if (myTZ.setLocation()) {
 		Serial.println(myTZ.dateTime());

@@ -1,0 +1,1 @@
+#define EZTIME_NETWORK_DISABLE

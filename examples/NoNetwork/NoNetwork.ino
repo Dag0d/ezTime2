@@ -1,6 +1,6 @@
 /*
- * This example also does something useful with "#define EZTIME_NETWORK_ENABLE" at the 
- * start of ezTime.h commented out. It will start the time at the time the code was
+ * This example is meant for builds that add EZTIME_NETWORK_DISABLE in
+ * ezTime2Config.h next to the sketch. It will start the time at the time the code was
  * compiled. You have to set your local timezone information by hand in the 
  * LOCALTZ_POSIX define. (The string contains the names for your TZ in standard and
  * Daylight Saving Time, as well as the starting and ending point for DST and the 
@@ -10,8 +10,7 @@
  * the current UTC offset in hours _west_ of UTC, like "PDT+7" 
  */
 
-
-#include <ezTime.h>
+#include <ezTime2.h>
 
 #define LOCALTZ_POSIX	"CET-1CEST,M3.4.0/2,M10.4.0/3"		// Time in Berlin
 

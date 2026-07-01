@@ -337,14 +337,16 @@ python3 querytest.py
 
 ### Standard Log Format
 ```
-[Day, DD Mon YYYY HH:MM:SS]Z -- IP:PORT -- STATUS FUNCTION: details
+[Day, DD Mon YYYY HH:MM:SS TZ +OFFSET] -- IP:PORT -- STATUS FUNCTION: details
 ```
+
+Log entries are written in the server's local timezone, controlled by the container's `TZ` environment variable. They are not UTC unless `TZ=UTC`.
 
 ### Examples
 ```
-Mon, 21 Jul 2025 13:45:30Z -- 192.168.1.100:54321 -- OK INFO: utcoffset [Europe/Berlin] -> +02:00
-Mon, 21 Jul 2025 13:45:31Z -- 192.168.1.100:54321 -- OK LIST: regions.lst
-Mon, 21 Jul 2025 13:45:32Z -- 192.168.1.100:54321 -- ERR INFO: ERROR Invalid infotype: invalid
+Mon, 21 Jul 2025 15:45:30 CEST +0200 -- 192.168.1.100:54321 -- OK INFO: utcoffset [Europe/Berlin] -> +02:00
+Mon, 21 Jul 2025 15:45:31 CEST +0200 -- 192.168.1.100:54321 -- OK LIST: regions.lst
+Mon, 21 Jul 2025 15:45:32 CEST +0200 -- 192.168.1.100:54321 -- ERR INFO: ERROR Invalid infotype: invalid
 ```
 
 ## Troubleshooting

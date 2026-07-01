@@ -42,8 +42,10 @@
 // #define EZTIME_MAX_DEBUGLEVEL_INFO
 
 // Cache mechanism, either EEPROM or NVS, not both. (See README)
+// Define EZTIME_CACHE_DISABLE to compile out timezone caching entirely.
 // If you define one of these in ezTime2Config.h or as a global build flag, that manual choice wins.
 // Otherwise ezTime2 defaults to NVS on ESP32 and EEPROM on other boards.
+// #define EZTIME_CACHE_DISABLE
 // #define EZTIME_CACHE_EEPROM
 // #define EZTIME_CACHE_NVS
 
@@ -89,11 +91,11 @@
 	#endif
 #endif
 
-#if defined(EZTIME_CACHE_EEPROM) && defined(EZTIME_CACHE_NVS)
-	#error "Only one of EZTIME_CACHE_EEPROM or EZTIME_CACHE_NVS may be defined."
+#if ((defined(EZTIME_CACHE_DISABLE) ? 1 : 0) + (defined(EZTIME_CACHE_EEPROM) ? 1 : 0) + (defined(EZTIME_CACHE_NVS) ? 1 : 0)) > 1
+	#error "Only one of EZTIME_CACHE_DISABLE, EZTIME_CACHE_EEPROM or EZTIME_CACHE_NVS may be defined."
 #endif
 
-#if !defined(EZTIME_CACHE_EEPROM) && !defined(EZTIME_CACHE_NVS)
+#if !defined(EZTIME_CACHE_DISABLE) && !defined(EZTIME_CACHE_EEPROM) && !defined(EZTIME_CACHE_NVS)
 	#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
 		#define EZTIME_CACHE_NVS
 	#else
@@ -143,7 +145,14 @@ typedef enum {
 	CACHE_TOO_SMALL,
 	TOO_MANY_EVENTS,
 	INVALID_DATA,
-	SERVER_ERROR
+	SERVER_ERROR,
+	INVALID_REQUEST,
+	RATE_LIMITED,
+	PROTOCOL_ERROR,
+	CHALLENGE_FAILED,
+	CHUNK_ERROR,
+	CRC_ERROR,
+	ASYNC_BUSY
 } ezError_t;
 
 typedef enum {
@@ -163,6 +172,21 @@ typedef enum {
 	EXT_GEOIP_LOOKUP_ONLY,
 	GEOIP_LOOKUP_WITH_EXT_FALLBACK
 } ezGeoLookupMode_t;
+
+typedef enum {
+	ASYNC_IDLE,
+	ASYNC_PENDING,
+	ASYNC_SUCCESS,
+	ASYNC_ERROR
+} ezAsyncStatus_t;
+
+typedef enum {
+	ASYNC_NONE,
+	ASYNC_GETIP,
+	ASYNC_INFO,
+	ASYNC_SETLOCATION,
+	ASYNC_LIST
+} ezAsyncType_t;
 
 #define SUNDAY			1
 #define MONDAY			2
@@ -287,6 +311,20 @@ namespace ezt {
 	String zeropad(const uint32_t number, const uint8_t length);
 
 	#ifdef EZTIME_NETWORK_ENABLE
+		bool asyncBusy();
+		ezAsyncStatus_t asyncStatus();
+		ezAsyncType_t asyncType();
+		void cancelAsync();
+		void pollAsync();
+		String asyncResult();
+		bool beginGetPublicIP();
+		bool beginInfo(const String infotype, const String target = "");
+		#ifdef EZTIME_SERVER_LIST_ENABLE
+			bool beginListTimezones(const String list_name);
+		#endif
+		bool getInfo(const String infotype, String &value, const String target = "");
+		bool getInfoAll(String &info_data, const String target = "");
+		bool infoItem(const String &info_data, const String &key, String &value);
 		bool getPublicIP(String &ip);
 		bool queryNTP(const String server, ezTime_t &t, unsigned long &measured_at);
 		void setInterval(const uint16_t seconds = 0);
@@ -333,6 +371,8 @@ class Timezone {
 		void setTime(const uint8_t hr, const uint8_t min, const uint8_t sec, const uint8_t day, const uint8_t mnth, uint16_t yr);
 		ezTime_t tzTime(ezTime_t t = TIME_NOW, ezLocalOrUTC_t local_or_utc = LOCAL_TIME);
 		ezTime_t tzTime(ezTime_t t, ezLocalOrUTC_t local_or_utc, String &tzname, bool &is_dst, int16_t &offset);
+		bool hasDST();
+		bool nextDSTChange(ezTime_t &transition, ezTime_t from = TIME_NOW, const ezLocalOrUTC_t local_or_utc = UTC_TIME);
 		uint8_t weekISO(ezTime_t t = TIME_NOW, const ezLocalOrUTC_t local_or_utc = LOCAL_TIME);
 		uint8_t weekday(ezTime_t t = TIME_NOW, const ezLocalOrUTC_t local_or_utc = LOCAL_TIME);
 		uint16_t year(ezTime_t t = TIME_NOW, const ezLocalOrUTC_t local_or_utc = LOCAL_TIME);
@@ -345,11 +385,13 @@ class Timezone {
 		private:
 			ezGeoLookupMode_t _geo_lookup_mode;
 		public:
+			bool beginSetLocation(const String location = "GeoIP");
 			bool setLocation(const String location = "GeoIP");
 			void setGeoLookupMode(const ezGeoLookupMode_t mode);
 			ezGeoLookupMode_t getGeoLookupMode() const;
 			String getOlson();
 			String getOlsen();
+			bool applyTimezoneData(const String &olson, const String &posix, const bool write_cache = true);
 		#ifdef EZTIME_CACHE_EEPROM
 			public:
 				bool setCache(const int16_t address);

@@ -159,6 +159,32 @@ static void cooldownAfterListRequest() {
 	delay(EZTIME2_SELFTEST_LIST_REQUEST_DELAY_MS);
 }
 
+template <typename Func>
+static bool runWithTimeoutRetries(const String &name, Func func, String &detail, const unsigned long retryDelayMs = EZTIME2_SELFTEST_SERVER_REQUEST_DELAY_MS, const uint8_t maxAttempts = 3) {
+	for (uint8_t attempt = 1; attempt <= maxAttempts; attempt++) {
+		if (func()) {
+			detail = "";
+			return true;
+		}
+
+		detail = ezt::errorString();
+		if (ezt::error() != TIMEOUT || attempt >= maxAttempts) {
+			return false;
+		}
+
+		Serial.print(F("[INFO] "));
+		Serial.print(name);
+		Serial.print(F(": timeout on attempt "));
+		Serial.print(attempt);
+		Serial.print(F(", retrying after "));
+		Serial.print(retryDelayMs);
+		Serial.println(F(" ms"));
+		delay(retryDelayMs);
+	}
+
+	return false;
+}
+
 static uint16_t findChildCount(const String &listData, const String &targetName) {
 #ifdef EZTIME_SERVER_LIST_ENABLE
 	uint16_t count = ezt::listLength(listData);
@@ -175,6 +201,35 @@ static uint16_t findChildCount(const String &listData, const String &targetName)
 	(void)targetName;
 	return 0xFFFF;
 #endif
+}
+
+static void printSummary(const __FlashStringHelper *title, const bool finalSummary) {
+	Serial.println();
+	Serial.println(title);
+	Serial.print(F("Passed : "));
+	Serial.println(stats.passed);
+	Serial.print(F("Failed : "));
+	Serial.println(stats.failed);
+	Serial.print(F("Skipped: "));
+	Serial.println(stats.skipped);
+
+	if (stats.failed) {
+		Serial.println(F("\nFailed tests:"));
+		Serial.print(stats.failures);
+	}
+
+	if (stats.skipped) {
+		Serial.println(F("\nSkipped tests:"));
+		Serial.print(stats.skips);
+	}
+
+	if (finalSummary) {
+		if (!stats.failed) {
+			Serial.println(F("\nOverall result: PASS"));
+		} else {
+			Serial.println(F("\nOverall result: FAIL"));
+		}
+	}
 }
 
 static void runCoreTests() {
@@ -248,6 +303,7 @@ static void runCoreTests() {
 	expectEqInt(F("Berlin summer offset"), berlin.getOffset(summerUtc, UTC_TIME), -120);
 	expectEqString(F("Berlin winter tz name"), berlin.getTimezoneName(winterUtc, UTC_TIME), F("CET"));
 	expectEqString(F("Berlin summer tz name"), berlin.getTimezoneName(summerUtc, UTC_TIME), F("CEST"));
+	expectTrue(F("Berlin hasDST"), berlin.hasDST());
 	expectFalse(F("Berlin winter isDST"), berlin.isDST(winterUtc, UTC_TIME));
 	expectTrue(F("Berlin summer isDST"), berlin.isDST(summerUtc, UTC_TIME));
 	expectEqString(F("Berlin winter militaryTZ"), berlin.militaryTZ(winterUtc, UTC_TIME), F("A"));
@@ -276,6 +332,11 @@ static void runCoreTests() {
 	expectEqString(F("Berlin.tzTime tzname"), tzname, F("CET"));
 	expectFalse(F("Berlin.tzTime isDst"), isDst);
 	expectEqInt(F("Berlin.tzTime offset"), offset, -60);
+	ezTime_t nextTransitionUtc = 0;
+	expectTrue(F("Berlin.nextDSTChange winter"), berlin.nextDSTChange(nextTransitionUtc, winterUtc, UTC_TIME));
+	expectEqInt(F("Berlin.nextDSTChange winter value"), nextTransitionUtc, makeUtc(2024, 3, 31, 1, 0, 0));
+	expectTrue(F("Berlin.nextDSTChange summer"), berlin.nextDSTChange(nextTransitionUtc, summerUtc, UTC_TIME));
+	expectEqInt(F("Berlin.nextDSTChange summer value"), nextTransitionUtc, makeUtc(2024, 10, 27, 1, 0, 0));
 	setUtcTime(2024, 1, 15, 12, 0, 0);
 	expectRange(F("Berlin.now"), berlin.now(), makeUtc(2024, 1, 15, 13, 0, 0), makeUtc(2024, 1, 15, 13, 0, 1));
 	berlin.setTime(makeUtc(2024, 1, 15, 18, 45, 30));
@@ -319,12 +380,40 @@ static void runCoreTests() {
 
 	Timezone nepal;
 	expectTrue(F("Nepal.setPosix"), nepal.setPosix(F("NPT-5:45")));
+	expectFalse(F("Nepal hasDST"), nepal.hasDST());
+	expectFalse(F("Nepal nextDSTChange"), nepal.nextDSTChange(nextTransitionUtc, winterUtc, UTC_TIME));
 	expectEqString(F("Nepal.militaryTZ"), nepal.militaryTZ(makeUtc(2024, 1, 1, 0, 0, 0), UTC_TIME), F("?"));
 
 	Timezone locked(true);
 	expectFalse(F("Locked TZ rejects setPosix"), locked.setPosix(F("CET-1")));
 	expectEqInt(F("error LOCKED_TO_UTC"), ezt::error(true), LOCKED_TO_UTC);
 	expectEqInt(F("error reset"), ezt::error(), NO_ERROR);
+
+	// 2036 remains within 32-bit range and should always work.
+	ezTime_t y2036 = makeUtc(2036, 2, 7, 6, 28, 16);
+	ezt::breakTime(y2036, tm);
+	expectEqInt(F("2036 year"), tm.Year + 1970, 2036);
+	expectEqInt(F("2036 month"), tm.Month, 2);
+	expectEqInt(F("2036 day"), tm.Day, 7);
+
+	ezTime_t max32 = makeUtc(2038, 1, 19, 3, 14, 7);
+	ezt::breakTime(max32, tm);
+	expectEqInt(F("2038 boundary year"), tm.Year + 1970, 2038);
+	expectEqInt(F("2038 boundary second"), tm.Second, 7);
+
+#if EZTIME_TIME_BITS == 64
+	ezTime_t y2040 = makeUtc(2040, 1, 1, 12, 0, 0);
+	ezt::breakTime(y2040, tm);
+	expectEqInt(F("2040 year in 64-bit mode"), tm.Year + 1970, 2040);
+	expectEqInt(F("2040 roundtrip in 64-bit mode"), ezt::makeTime(tm), y2040);
+#else
+	addSkip(F("2040 year in 64-bit mode"), F("32-bit time mode"));
+	addSkip(F("2040 roundtrip in 64-bit mode"), F("32-bit time mode"));
+#endif
+}
+
+static void runExtendedRuntimeTests() {
+	Serial.println(F("\n== Extended runtime tests =="));
 
 	UTC.setPosix(F("UTC"));
 	setUtcTime(2024, 1, 1, 0, 0, 0);
@@ -375,28 +464,6 @@ static void runCoreTests() {
 	expectEqInt(F("too many events"), UTC.setEvent(eventB, UTC.now() + 99, UTC_TIME), 0);
 	expectEqInt(F("error TOO_MANY_EVENTS"), ezt::error(true), TOO_MANY_EVENTS);
 	ezt::deleteEvent(eventB);
-
-	// 2036 remains within 32-bit range and should always work.
-	ezTime_t y2036 = makeUtc(2036, 2, 7, 6, 28, 16);
-	ezt::breakTime(y2036, tm);
-	expectEqInt(F("2036 year"), tm.Year + 1970, 2036);
-	expectEqInt(F("2036 month"), tm.Month, 2);
-	expectEqInt(F("2036 day"), tm.Day, 7);
-
-	ezTime_t max32 = makeUtc(2038, 1, 19, 3, 14, 7);
-	ezt::breakTime(max32, tm);
-	expectEqInt(F("2038 boundary year"), tm.Year + 1970, 2038);
-	expectEqInt(F("2038 boundary second"), tm.Second, 7);
-
-#if EZTIME_TIME_BITS == 64
-	ezTime_t y2040 = makeUtc(2040, 1, 1, 12, 0, 0);
-	ezt::breakTime(y2040, tm);
-	expectEqInt(F("2040 year in 64-bit mode"), tm.Year + 1970, 2040);
-	expectEqInt(F("2040 roundtrip in 64-bit mode"), ezt::makeTime(tm), y2040);
-#else
-	addSkip(F("2040 year in 64-bit mode"), F("32-bit time mode"));
-	addSkip(F("2040 roundtrip in 64-bit mode"), F("32-bit time mode"));
-#endif
 }
 
 static void runNetworkTests() {
@@ -430,7 +497,11 @@ static void runNetworkTests() {
 
 	ezTime_t ntpTime = 0;
 	unsigned long measuredAt = 0;
-	expectTrue(F("queryNTP"), ezt::queryNTP(NTP_SERVER, ntpTime, measuredAt), ezt::errorString());
+	String retryDetail;
+	bool queryNtpOk = runWithTimeoutRetries(F("queryNTP"), [&]() {
+		return ezt::queryNTP(NTP_SERVER, ntpTime, measuredAt);
+	}, retryDetail, 1500UL);
+	expectTrue(F("queryNTP"), queryNtpOk, retryDetail);
 	if (ntpTime > 0) {
 		expectTrue(F("queryNTP unix time sane"), ntpTime > (ezTime_t)1700000000LL);
 		expectTrue(F("queryNTP measuredAt sane"), measuredAt <= millis());
@@ -441,9 +512,53 @@ static void runNetworkTests() {
 	expectEqInt(F("updateNTP leaves no error"), ezt::error(true), NO_ERROR);
 
 	String publicIP;
-	expectTrue(F("getPublicIP"), ezt::getPublicIP(publicIP), ezt::errorString());
+	bool publicIpOk = runWithTimeoutRetries(F("getPublicIP"), [&]() {
+		return ezt::getPublicIP(publicIP);
+	}, retryDetail);
+	expectTrue(F("getPublicIP"), publicIpOk, retryDetail);
 	if (publicIP.length()) {
 		expectTrue(F("getPublicIP non-empty"), publicIP.length() >= 7);
+	}
+	cooldownAfterServerRequest();
+
+	String infoValue;
+	bool infoOffsetOk = runWithTimeoutRetries(F("getInfo utcoffset"), [&]() {
+		return ezt::getInfo(F("utcoffset"), infoValue, F("Europe/Berlin"));
+	}, retryDetail);
+	expectTrue(F("getInfo utcoffset"), infoOffsetOk, retryDetail);
+	if (infoValue.length()) {
+		expectEqString(F("getInfo utcoffset value"), infoValue, F("+02:00"));
+	}
+	cooldownAfterServerRequest();
+
+	String infoAll;
+	bool infoAllOk = runWithTimeoutRetries(F("getInfoAll"), [&]() {
+		return ezt::getInfoAll(infoAll, F("Europe/Berlin"));
+	}, retryDetail);
+	expectTrue(F("getInfoAll"), infoAllOk, retryDetail);
+	if (infoAll.length()) {
+		String olsonValue;
+		expectTrue(F("infoItem olson"), ezt::infoItem(infoAll, F("olson"), olsonValue));
+		if (olsonValue.length()) {
+			expectEqString(F("infoItem olson value"), olsonValue, F("Europe/Berlin"));
+		}
+	}
+	cooldownAfterServerRequest();
+
+	bool asyncInfoOk = runWithTimeoutRetries(F("beginInfo async"), [&]() {
+		if (!ezt::beginInfo(F("epoch"), F("Europe/Berlin"))) {
+			return false;
+		}
+		while (ezt::asyncStatus() == ASYNC_PENDING) {
+			ezt::pollAsync();
+			delay(1);
+		}
+		return ezt::asyncStatus() == ASYNC_SUCCESS;
+	}, retryDetail);
+	expectTrue(F("beginInfo async"), asyncInfoOk, retryDetail);
+	if (asyncInfoOk) {
+		expectEqInt(F("async info status"), ezt::asyncStatus(), ASYNC_SUCCESS);
+		expectTrue(F("async info non-empty"), ezt::asyncResult().length() > 0);
 	}
 	cooldownAfterServerRequest();
 
@@ -455,19 +570,43 @@ static void runNetworkTests() {
 	netTZ.setGeoLookupMode(GEOIP_LOOKUP_WITH_EXT_FALLBACK);
 	expectEqInt(F("getGeoLookupMode fallback"), netTZ.getGeoLookupMode(), GEOIP_LOOKUP_WITH_EXT_FALLBACK);
 
-	bool locationTimezoneOk = netTZ.setLocation(F("Pacific/Auckland"));
-	expectTrue(F("setLocation timezone"), locationTimezoneOk, ezt::errorString());
+	bool locationTimezoneOk = runWithTimeoutRetries(F("setLocation timezone"), [&]() {
+		return netTZ.setLocation(F("Pacific/Auckland"));
+	}, retryDetail);
+	expectTrue(F("setLocation timezone"), locationTimezoneOk, retryDetail);
 	if (locationTimezoneOk && netTZ.getOlson().length()) {
 		expectEqString(F("getOlson"), netTZ.getOlson(), F("Pacific/Auckland"));
 		expectEqString(F("getOlsen"), netTZ.getOlsen(), F("Pacific/Auckland"));
 	}
 	cooldownAfterServerRequest();
 
-	bool locationCountryOk = netTZ.setLocation(F("DE"));
-	expectTrue(F("setLocation country"), locationCountryOk, ezt::errorString());
+	bool locationCountryOk = runWithTimeoutRetries(F("setLocation country"), [&]() {
+		return netTZ.setLocation(F("DE"));
+	}, retryDetail);
+	expectTrue(F("setLocation country"), locationCountryOk, retryDetail);
 	cooldownAfterServerRequest();
 
-	if (netTZ.setLocation()) {
+	bool asyncSetLocationOk = runWithTimeoutRetries(F("beginSetLocation async"), [&]() {
+		if (!netTZ.beginSetLocation(F("Europe/Berlin"))) {
+			return false;
+		}
+		while (ezt::asyncStatus() == ASYNC_PENDING) {
+			ezt::pollAsync();
+			delay(1);
+		}
+		return ezt::asyncStatus() == ASYNC_SUCCESS;
+	}, retryDetail);
+	expectTrue(F("beginSetLocation async"), asyncSetLocationOk, retryDetail);
+	if (asyncSetLocationOk) {
+		expectEqInt(F("async setLocation status"), ezt::asyncStatus(), ASYNC_SUCCESS);
+		expectEqString(F("async setLocation olson"), netTZ.getOlson(), F("Europe/Berlin"));
+	}
+	cooldownAfterServerRequest();
+
+	bool geoipOk = runWithTimeoutRetries(F("setLocation GEOIP"), [&]() {
+		return netTZ.setLocation();
+	}, retryDetail);
+	if (geoipOk) {
 		addPass(F("setLocation GEOIP"));
 	} else {
 		String geoipError = ezt::errorString();
@@ -479,7 +618,10 @@ static void runNetworkTests() {
 	}
 	cooldownAfterServerRequest();
 
-	expectTrue(F("setLocation EXT_GEOIP"), netTZ.setLocation(F("EXT_GEOIP")), ezt::errorString());
+	bool extGeoipOk = runWithTimeoutRetries(F("setLocation EXT_GEOIP"), [&]() {
+		return netTZ.setLocation(F("EXT_GEOIP"));
+	}, retryDetail);
+	expectTrue(F("setLocation EXT_GEOIP"), extGeoipOk, retryDetail);
 	cooldownAfterServerRequest();
 
 #if defined(EZTIME_CACHE_EEPROM)
@@ -490,8 +632,10 @@ static void runNetworkTests() {
 #else
 	Timezone cacheTZ;
 	(void)cacheTZ.setCache(0);
-	bool eepromWriteOk = cacheTZ.setLocation(F("Europe/Berlin"));
-	expectTrue(F("EEPROM cache write source"), eepromWriteOk, ezt::errorString());
+	bool eepromWriteOk = runWithTimeoutRetries(F("EEPROM cache write source"), [&]() {
+		return cacheTZ.setLocation(F("Europe/Berlin"));
+	}, retryDetail);
+	expectTrue(F("EEPROM cache write source"), eepromWriteOk, retryDetail);
 	cooldownAfterServerRequest();
 	if (eepromWriteOk) {
 		expectTrue(F("EEPROM cache read"), cacheTZ.setCache(0), F("expected freshly written cache to read back"));
@@ -505,8 +649,10 @@ static void runNetworkTests() {
 #elif defined(EZTIME_CACHE_NVS)
 	Timezone cacheTZ;
 	(void)cacheTZ.setCache(F("eztime2"), F("selftest"));
-	bool nvsWriteOk = cacheTZ.setLocation(F("Europe/Berlin"));
-	expectTrue(F("NVS cache write source"), nvsWriteOk, ezt::errorString());
+	bool nvsWriteOk = runWithTimeoutRetries(F("NVS cache write source"), [&]() {
+		return cacheTZ.setLocation(F("Europe/Berlin"));
+	}, retryDetail);
+	expectTrue(F("NVS cache write source"), nvsWriteOk, retryDetail);
 	cooldownAfterServerRequest();
 	if (nvsWriteOk) {
 		expectTrue(F("NVS cache read"), cacheTZ.setCache(F("eztime2"), F("selftest")), F("expected freshly written cache to read back"));
@@ -523,8 +669,10 @@ static void runNetworkTests() {
 #ifdef EZTIME_SERVER_LIST_ENABLE
 	String regions;
 	String america;
-	bool regionsOk = ezt::listTimezones(F("regions"), regions);
-	expectTrue(F("listTimezones regions"), regionsOk, ezt::errorString());
+	bool regionsOk = runWithTimeoutRetries(F("listTimezones regions"), [&]() {
+		return ezt::listTimezones(F("regions"), regions);
+	}, retryDetail, EZTIME2_SELFTEST_LIST_REQUEST_DELAY_MS);
+	expectTrue(F("listTimezones regions"), regionsOk, retryDetail);
 	cooldownAfterListRequest();
 	if (regionsOk) {
 		expectTrue(F("listLength regions"), ezt::listLength(regions) > 0);
@@ -537,8 +685,10 @@ static void runNetworkTests() {
 		addSkip(F("listItem regions[0]"), F("regions lookup failed"));
 	}
 
-	bool americaOk = ezt::listTimezones(F("america"), america);
-	expectTrue(F("listTimezones america"), americaOk, ezt::errorString());
+	bool americaOk = runWithTimeoutRetries(F("listTimezones america"), [&]() {
+		return ezt::listTimezones(F("america"), america);
+	}, retryDetail, EZTIME2_SELFTEST_LIST_REQUEST_DELAY_MS);
+	expectTrue(F("listTimezones america"), americaOk, retryDetail);
 	cooldownAfterListRequest();
 	if (americaOk) {
 		uint16_t americaCount = ezt::listLength(america);
@@ -558,38 +708,29 @@ static void runNetworkTests() {
 		addSkip(F("regions contains America"), F("america lookup failed"));
 		addSkip(F("America child count matches list"), F("america lookup failed"));
 	}
+
+	bool asyncListOk = runWithTimeoutRetries(F("beginListTimezones async"), [&]() {
+		if (!ezt::beginListTimezones(F("europe"))) {
+			return false;
+		}
+		while (ezt::asyncStatus() == ASYNC_PENDING) {
+			ezt::pollAsync();
+			delay(1);
+		}
+		return ezt::asyncStatus() == ASYNC_SUCCESS;
+	}, retryDetail, EZTIME2_SELFTEST_LIST_REQUEST_DELAY_MS);
+	expectTrue(F("beginListTimezones async"), asyncListOk, retryDetail);
+	if (asyncListOk) {
+		expectEqInt(F("async list status"), ezt::asyncStatus(), ASYNC_SUCCESS);
+		expectTrue(F("async list non-empty"), ezt::asyncResult().length() > 0);
+	}
+	cooldownAfterListRequest();
 #else
 	addSkip(F("LIST tests"), F("EZTIME_SERVER_LIST_ENABLE is disabled"));
 #endif
 
 	ezt::setInterval(0);
 #endif
-}
-
-static void printSummary() {
-	Serial.println(F("\n== Summary =="));
-	Serial.print(F("Passed : "));
-	Serial.println(stats.passed);
-	Serial.print(F("Failed : "));
-	Serial.println(stats.failed);
-	Serial.print(F("Skipped: "));
-	Serial.println(stats.skipped);
-
-	if (stats.failed) {
-		Serial.println(F("\nFailed tests:"));
-		Serial.print(stats.failures);
-	}
-
-	if (stats.skipped) {
-		Serial.println(F("\nSkipped tests:"));
-		Serial.print(stats.skips);
-	}
-
-	if (!stats.failed) {
-		Serial.println(F("\nOverall result: PASS"));
-	} else {
-		Serial.println(F("\nOverall result: FAIL"));
-	}
 }
 
 void setup() {
@@ -606,7 +747,14 @@ void setup() {
 
 	runCoreTests();
 	runNetworkTests();
-	printSummary();
+	printSummary(F("== Main Summary =="), false);
+
+	if (!stats.failed) {
+		runExtendedRuntimeTests();
+	} else {
+		addSkip(F("Extended runtime tests"), F("main test phase had failures"));
+	}
+	printSummary(F("== Complete Summary =="), true);
 }
 
 void loop() {

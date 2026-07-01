@@ -76,6 +76,8 @@
 
 const uint8_t monthDays[]={31,28,31,30,31,30,31,31,30,31,30,31}; // API starts months from 1, this array starts from 0
 
+class Timezone;
+
 // The private things go in an anonymous namespace
 namespace {
 
@@ -90,10 +92,74 @@ namespace {
 	uint16_t _last_read_ms;
 	timeStatus_t _time_status;
 	bool _initialised = false;
+
+	typedef struct {
+		bool has_dst;
+		int16_t std_offset;
+		int16_t dst_offset;
+		uint8_t start_month;
+		uint8_t start_week;
+		uint8_t start_dow;
+		uint8_t start_time_hr;
+		uint8_t start_time_min;
+		uint8_t end_month;
+		uint8_t end_week;
+		uint8_t end_dow;
+		uint8_t end_time_hr;
+		uint8_t end_time_min;
+		uint8_t stdname_end;
+		uint8_t dstname_begin;
+		uint8_t dstname_end;
+	} ezPosixRule_t;
+
 	#ifdef EZTIME_NETWORK_ENABLE
 		uint16_t _ntp_interval = NTP_INTERVAL;
 		String _ntp_servers[3] = { NTP_SERVER, NTP_SERVER_2, NTP_SERVER_3 };
 		uint32_t _server_request_counter = 0;
+
+		typedef enum {
+			SERVER_PHASE_IDLE,
+			SERVER_PHASE_WAIT_RESPONSE,
+			SERVER_PHASE_WAIT_LIST_CHALLENGE,
+			SERVER_PHASE_WAIT_LIST_CHUNKS,
+			SERVER_PHASE_DONE
+		} ezServerPhase_t;
+
+		typedef struct {
+			ezAsyncStatus_t status;
+			ezAsyncType_t type;
+			ezServerPhase_t phase;
+			EzTimeUdp udp;
+			unsigned long started;
+			String query;
+			String request_id;
+			String result;
+			String info_type;
+			String target;
+			Timezone *timezone;
+			bool allow_ext_geoip_fallback;
+			String *chunks;
+			bool *received;
+			uint16_t total_chunks;
+			uint16_t received_count;
+		} ezServerAsyncState_t;
+
+		typedef enum {
+			NTP_PHASE_IDLE,
+			NTP_PHASE_WAIT_RESPONSE
+		} ezNtpPhase_t;
+
+		typedef struct {
+			bool active;
+			ezNtpPhase_t phase;
+			EzTimeUdp udp;
+			unsigned long started;
+			uint8_t server_index;
+			byte buffer[NTP_PACKET_SIZE];
+		} ezNtpAsyncState_t;
+
+		ezServerAsyncState_t _server_async = { ASYNC_IDLE, ASYNC_NONE, SERVER_PHASE_IDLE, EzTimeUdp(), 0, "", "", "", "", "", NULL, false, NULL, NULL, 0, 0 };
+		ezNtpAsyncState_t _ntp_async = { false, NTP_PHASE_IDLE, EzTimeUdp(), 0, 0, { 0 } };
 	#endif
 
 	void triggerError(const ezError_t err) {
@@ -130,7 +196,47 @@ namespace {
 		return String(buffer);
 	}
 
+	ezError_t classifyServerError(const String &server_error) {
+		if (server_error.indexOf(F("Rate Limited")) >= 0 || server_error == F("Server Busy")) {
+			return RATE_LIMITED;
+		}
+		if (server_error.indexOf(F("Invalid")) >= 0 || server_error.indexOf(F("Missing")) >= 0) {
+			return INVALID_REQUEST;
+		}
+		return SERVER_ERROR;
+	}
+
 	#ifdef EZTIME_NETWORK_ENABLE
+
+		void clearServerAsyncBuffers() {
+			if (_server_async.chunks != NULL) {
+				delete[] _server_async.chunks;
+				_server_async.chunks = NULL;
+			}
+			if (_server_async.received != NULL) {
+				delete[] _server_async.received;
+				_server_async.received = NULL;
+			}
+			_server_async.total_chunks = 0;
+			_server_async.received_count = 0;
+		}
+
+		void finishServerAsync(const bool success, const ezError_t err = NO_ERROR, const String &server_error = "") {
+			_server_async.udp.stop();
+			clearServerAsyncBuffers();
+			_server_async.phase = SERVER_PHASE_DONE;
+			if (success) {
+				_server_async.status = ASYNC_SUCCESS;
+				_last_error = NO_ERROR;
+				_server_error = "";
+			} else {
+				if (server_error.length()) {
+					_server_error = server_error;
+				}
+				triggerError(err ? err : SERVER_ERROR);
+				_server_async.status = ASYNC_ERROR;
+			}
+		}
 
 		bool networkReady() {
 			#ifndef EZTIME_ETHERNET
@@ -153,6 +259,27 @@ namespace {
 			udp.beginPacket(TIMEZONED_REMOTE_HOST, TIMEZONED_REMOTE_PORT);
 			udp.write((const uint8_t*)query.c_str(), query.length());
 			udp.endPacket();
+			return true;
+		}
+
+		bool beginServerQueryNonBlocking(EzTimeUdp &udp, const String &query, unsigned long &started) {
+			if (!networkReady()) {
+				return false;
+			}
+
+			udp.flush();
+			udp.begin(TIMEZONED_LOCAL_PORT);
+			started = millis();
+			if (!udp.beginPacket(TIMEZONED_REMOTE_HOST, TIMEZONED_REMOTE_PORT)) {
+				triggerError(CONNECT_FAILED);
+				return false;
+			}
+			udp.write((const uint8_t*)query.c_str(), query.length());
+			if (!udp.endPacket()) {
+				udp.stop();
+				triggerError(CONNECT_FAILED);
+				return false;
+			}
 			return true;
 		}
 
@@ -191,6 +318,14 @@ namespace {
 			String out = value;
 			out.trim();
 			return out;
+		}
+
+		bool parseInfoResponse(const String &response, String &payload) {
+			if (!startsWithIgnoreCase(response, F("INFO OK "))) {
+				return false;
+			}
+			payload = response.substring(8);
+			return true;
 		}
 
 		#ifdef EZTIME_SERVER_LIST_ENABLE
@@ -367,6 +502,184 @@ namespace {
 
 	#endif
 
+	bool parsePosixRule(const String &posix, ezPosixRule_t &rule) {
+			memset(&rule, 0, sizeof(rule));
+			rule.start_time_hr = 2;
+			rule.end_time_hr = 2;
+			rule.stdname_end = posix.length() ? posix.length() - 1 : 0;
+			rule.dstname_begin = posix.length();
+			rule.dstname_end = posix.length();
+
+			int8_t offset_hr = 0;
+			uint8_t offset_min = 0;
+			int8_t dst_shift_hr = 1;
+			uint8_t dst_shift_min = 0;
+
+			enum posix_state_e {STD_NAME, OFFSET_HR, OFFSET_MIN, DST_NAME, DST_SHIFT_HR, DST_SHIFT_MIN, START_MONTH, START_WEEK, START_DOW, START_TIME_HR, START_TIME_MIN, END_MONTH, END_WEEK, END_DOW, END_TIME_HR, END_TIME_MIN};
+			posix_state_e state = STD_NAME;
+			bool ignore_nums = false;
+			uint8_t strpos = 0;
+
+			while (strpos < posix.length()) {
+				char c = (char)posix[strpos];
+
+				if (c && state == STD_NAME) {
+					if (c == '<') ignore_nums = true;
+					if (c == '>') ignore_nums = false;
+					if (!ignore_nums && (isDigit(c) || c == '-' || c == '+')) {
+						state = OFFSET_HR;
+						rule.stdname_end = strpos - 1;
+					}
+				}
+				if (c && state == OFFSET_HR) {
+					if (c == '+') {
+					} else if (c == ':') {
+						state = OFFSET_MIN;
+						c = 0;
+					} else if (c != '-' && !isDigit(c)) {
+						state = DST_NAME;
+						rule.dstname_begin = strpos;
+					} else if (!offset_hr) {
+						offset_hr = atoi(posix.c_str() + strpos);
+					}
+				}
+				if (c && state == OFFSET_MIN) {
+					if (!isDigit(c)) {
+						state = DST_NAME;
+						rule.dstname_begin = strpos;
+						ignore_nums = false;
+					} else if (!offset_min) {
+						offset_min = atoi(posix.c_str() + strpos);
+					}
+				}
+				if (c && state == DST_NAME) {
+					if (c == '<') ignore_nums = true;
+					if (c == '>') ignore_nums = false;
+					if (c == ',') {
+						state = START_MONTH;
+						rule.dstname_end = strpos - 1;
+						c = 0;
+					} else if (!ignore_nums && (c == '-' || isDigit(c))) {
+						state = DST_SHIFT_HR;
+						rule.dstname_end = strpos - 1;
+					}
+				}
+				if (c && state == DST_SHIFT_HR) {
+					if (c == ':') {
+						state = DST_SHIFT_MIN;
+						c = 0;
+					} else if (c == ',') {
+						state = START_MONTH;
+						c = 0;
+					} else if (dst_shift_hr == 1) {
+						dst_shift_hr = atoi(posix.c_str() + strpos);
+					}
+				}
+				if (c && state == DST_SHIFT_MIN) {
+					if (c == ',') {
+						state = START_MONTH;
+						c = 0;
+					} else if (!dst_shift_min) {
+						dst_shift_min = atoi(posix.c_str() + strpos);
+					}
+				}
+				if (c && state == START_MONTH) {
+					if (c == '.') {
+						state = START_WEEK;
+						c = 0;
+					} else if (c != 'M' && !rule.start_month) {
+						rule.start_month = atoi(posix.c_str() + strpos);
+					}
+				}
+				if (c && state == START_WEEK) {
+					if (c == '.') {
+						state = START_DOW;
+						c = 0;
+					} else rule.start_week = c - '0';
+				}
+				if (c && state == START_DOW) {
+					if (c == '/') {
+						state = START_TIME_HR;
+						c = 0;
+					} else if (c == ',') {
+						state = END_MONTH;
+						c = 0;
+					} else rule.start_dow = c - '0';
+				}
+				if (c && state == START_TIME_HR) {
+					if (c == ':') {
+						state = START_TIME_MIN;
+						c = 0;
+					} else if (c == ',') {
+						state = END_MONTH;
+						c = 0;
+					} else if (rule.start_time_hr == 2) {
+						rule.start_time_hr = atoi(posix.c_str() + strpos);
+					}
+				}
+				if (c && state == START_TIME_MIN) {
+					if (c == ',') {
+						state = END_MONTH;
+						c = 0;
+					} else if (!rule.start_time_min) {
+						rule.start_time_min = atoi(posix.c_str() + strpos);
+					}
+				}
+				if (c && state == END_MONTH) {
+					if (c == '.') {
+						state = END_WEEK;
+						c = 0;
+					} else if (c != 'M' && !rule.end_month) {
+						rule.end_month = atoi(posix.c_str() + strpos);
+					}
+				}
+				if (c && state == END_WEEK) {
+					if (c == '.') {
+						state = END_DOW;
+						c = 0;
+					} else rule.end_week = c - '0';
+				}
+				if (c && state == END_DOW) {
+					if (c == '/') {
+						state = END_TIME_HR;
+						c = 0;
+					} else rule.end_dow = c - '0';
+				}
+				if (c && state == END_TIME_HR) {
+					if (c == ':') {
+						state = END_TIME_MIN;
+						c = 0;
+					} else if (rule.end_time_hr == 2) {
+						rule.end_time_hr = atoi(posix.c_str() + strpos);
+					}
+				}
+				if (c && state == END_TIME_MIN) {
+					if (!rule.end_time_min) {
+						rule.end_time_min = atoi(posix.c_str() + strpos);
+					}
+				}
+				strpos++;
+			}
+
+			rule.std_offset = (offset_hr < 0) ? offset_hr * 60 - offset_min : offset_hr * 60 + offset_min;
+			if (!rule.start_month) {
+				rule.has_dst = false;
+				rule.dst_offset = rule.std_offset;
+				return true;
+			}
+
+			rule.has_dst = true;
+			rule.dst_offset = rule.std_offset - dst_shift_hr * 60 - dst_shift_min;
+			return true;
+		}
+
+	void computeDstTransitions(const ezPosixRule_t &rule, const uint16_t year, ezTime_t &dst_start_utc, ezTime_t &dst_end_utc) {
+			dst_start_utc = ezt::makeOrdinalTime(rule.start_time_hr, rule.start_time_min, 0, rule.start_week, rule.start_dow + 1, rule.start_month, year);
+			dst_end_utc = ezt::makeOrdinalTime(rule.end_time_hr, rule.end_time_min, 0, rule.end_week, rule.end_dow + 1, rule.end_month, year);
+			dst_start_utc += rule.std_offset * 60LL;
+			dst_end_utc += rule.dst_offset * 60LL;
+		}
+
 	ezTime_t ntpReferenceUnixTime() {
 		if (_time_status == timeSet && _last_sync_time > 0) {
 			return nowUTC(false);
@@ -417,7 +730,14 @@ namespace ezt {
 			case CACHE_TOO_SMALL: return		F("Cache too small");
 			case TOO_MANY_EVENTS: return		F("Too many events");
 			case INVALID_DATA: return			F("Invalid data received from NTP server");
-			case SERVER_ERROR: return			_server_error; 
+			case SERVER_ERROR: return			_server_error;
+			case INVALID_REQUEST: return		F("Invalid request");
+			case RATE_LIMITED: return			F("Rate limited");
+			case PROTOCOL_ERROR: return			F("Protocol error");
+			case CHALLENGE_FAILED: return		F("Challenge failed");
+			case CHUNK_ERROR: return			F("Invalid chunk data");
+			case CRC_ERROR: return				F("Chunk CRC failed");
+			case ASYNC_BUSY: return				F("Another async request is already running");
 			default: return						F("Unkown error");
 		}
 	}
@@ -464,6 +784,9 @@ namespace ezt {
 			#endif
 			_initialised = true;
 		}
+		#ifdef EZTIME_NETWORK_ENABLE
+			pollAsync();
+		#endif
 		// See if any events are due
 		for (uint8_t n = 0; n < MAX_EVENTS; n++) {
 			if (_events[n].function && nowUTC(false) >= _events[n].time) {
@@ -717,40 +1040,72 @@ namespace ezt {
 			return false;
 		}
 
+		bool beginNtpAsyncRequest(const uint8_t server_index) {
+			String server = _ntp_servers[server_index];
+			server.trim();
+			if (!server.length()) {
+				triggerError(INVALID_DATA);
+				return false;
+			}
+
+			#ifndef EZTIME_ETHERNET
+				if (WiFi.status() != WL_CONNECTED) { triggerError(NO_NETWORK); return false; }
+			#endif
+
+			memset(_ntp_async.buffer, 0, NTP_PACKET_SIZE);
+			_ntp_async.buffer[0] = 0b11100011;
+			_ntp_async.buffer[1] = 0;
+			_ntp_async.buffer[2] = 9;
+			_ntp_async.buffer[3] = 0xEC;
+			_ntp_async.buffer[12] = 'X';
+			_ntp_async.buffer[13] = 'E';
+			_ntp_async.buffer[14] = 'Z';
+			_ntp_async.buffer[15] = 'T';
+
+			_ntp_async.udp.flush();
+			_ntp_async.udp.begin(NTP_LOCAL_PORT);
+			_ntp_async.started = millis();
+			if (!_ntp_async.udp.beginPacket(server.c_str(), 123)) {
+				_ntp_async.udp.stop();
+				triggerError(CONNECT_FAILED);
+				return false;
+			}
+			_ntp_async.udp.write(_ntp_async.buffer, NTP_PACKET_SIZE);
+			if (!_ntp_async.udp.endPacket()) {
+				_ntp_async.udp.stop();
+				triggerError(CONNECT_FAILED);
+				return false;
+			}
+
+			info(F("Querying "));
+			info(server);
+			info(F(" ... "));
+
+			_ntp_async.active = true;
+			_ntp_async.phase = NTP_PHASE_WAIT_RESPONSE;
+			_ntp_async.server_index = server_index;
+			return true;
+		}
+
 		void updateNTP() {
 			deleteEvent(updateNTP);	// Delete any events pointing here, in case called manually
-			ezTime_t t;
-			unsigned long measured_at;
-			if (queryNTPWithFallbacks(t, measured_at)) {
-				int64_t correction = ((int64_t)(t - _last_sync_time) * 1000LL) - (int64_t)(measured_at - _last_sync_millis);
-				_last_sync_time = t;
-				_last_sync_millis = measured_at;
-				_last_read_ms = (millis() - measured_at) % 1000;
-				info(F("Received time: "));
-				info(UTC.dateTime(t, F("l, d-M-y H:i:s.v T")));
-				if (_time_status != timeNotSet) {
-					info(F(" (internal clock was "));
-					if (!correction) {
-						infoln(F("spot on)"));
-					} else {
-						info(int64ToString(correction < 0 ? -correction : correction));
-						if (correction > 0) {
-							infoln(F(" ms fast)"));
-						} else {
-							infoln(F(" ms slow)"));
-						}
-					}
-				} else {
-					infoln("");
-				}
-				if (_ntp_interval) UTC.setEvent(updateNTP, t + _ntp_interval);
-				_time_status = timeSet;
-			} else {
-				if (nowUTC(false) > _last_sync_time + _ntp_interval + NTP_STALE_AFTER) {
-					_time_status = timeNeedsSync;
-				}
-				UTC.setEvent(updateNTP, nowUTC(false) + NTP_RETRY);
+			if (_ntp_async.active) {
+				return;
 			}
+			for (uint8_t i = 0; i < 3; i++) {
+				String server = _ntp_servers[i];
+				server.trim();
+				if (!server.length()) {
+					continue;
+				}
+				if (beginNtpAsyncRequest(i)) {
+					return;
+				}
+			}
+			if (nowUTC(false) > _last_sync_time + _ntp_interval + NTP_STALE_AFTER) {
+				_time_status = timeNeedsSync;
+			}
+			UTC.setEvent(updateNTP, nowUTC(false) + NTP_RETRY);
 		}
 
 		// This is a nice self-contained NTP routine if you need one: feel free to use it.
@@ -961,186 +1316,39 @@ ezTime_t Timezone::tzTime(ezTime_t t, ezLocalOrUTC_t local_or_utc, String &tznam
 		local_or_utc = UTC_TIME;
 	}
 	
-	int8_t offset_hr = 0;
-	uint8_t offset_min = 0;
-	int8_t dst_shift_hr = 1;
-	uint8_t dst_shift_min = 0;
-	
-	uint8_t start_month = 0, start_week = 0, start_dow = 0, start_time_hr = 2, start_time_min = 0;
-	uint8_t end_month = 0, end_week = 0, end_dow = 0, end_time_hr = 2, end_time_min = 0;
-	
-	enum posix_state_e {STD_NAME, OFFSET_HR, OFFSET_MIN, DST_NAME, DST_SHIFT_HR, DST_SHIFT_MIN, START_MONTH, START_WEEK, START_DOW, START_TIME_HR, START_TIME_MIN, END_MONTH, END_WEEK, END_DOW, END_TIME_HR, END_TIME_MIN};
-	posix_state_e state = STD_NAME; 
+	ezPosixRule_t rule;
+	parsePosixRule(_posix, rule);
 
-	bool ignore_nums = false;
-	char c = 1; // Dummy value to get while(newchar) started
-	uint8_t strpos = 0;
-	uint8_t stdname_end = _posix.length() - 1;
-	uint8_t dstname_begin = _posix.length();
-	uint8_t dstname_end = _posix.length();
-
-	while (strpos < _posix.length()) {
-		c = (char)_posix[strpos];
-
-		// Do not replace the code below with switch statement: evaluation of state that 
-		// changes while this runs. (Only works because this state can only go forward.)
-
-		if (c && state == STD_NAME) {
-			if (c == '<') ignore_nums = true;
-			if (c == '>') ignore_nums = false;
-			if (!ignore_nums && (isDigit(c) || c == '-'  || c == '+')) {
-				state = OFFSET_HR;
-				stdname_end = strpos - 1;
-			}
-		}
-		if (c && state == OFFSET_HR) {
-			if (c == '+') {
-				// Ignore the plus
-			} else if (c == ':') {
-				state = OFFSET_MIN;
-				c = 0;
-			} else if (c != '-' && !isDigit(c)) {
-				state = DST_NAME;
-				dstname_begin = strpos;
-			} else {
-				if (!offset_hr) offset_hr = atoi(_posix.c_str() + strpos);
-			}
-		}			
-		if (c && state == OFFSET_MIN) {
-			if (!isDigit(c)) {
-				state = DST_NAME;
-				dstname_begin = strpos;
-				ignore_nums = false;
-			} else {
-				if (!offset_min) offset_min = atoi(_posix.c_str() + strpos);
-			}
-		}				
-		if (c && state == DST_NAME) {
-			if (c == '<') ignore_nums = true;
-			if (c == '>') ignore_nums = false;
-			if (c == ',') {
-				state = START_MONTH;
-				c = 0;
-				dstname_end = strpos - 1;
-			} else if (!ignore_nums && (c == '-' || isDigit(c))) {
-				state = DST_SHIFT_HR;
-				dstname_end = strpos - 1;
-			}
-		}		
-		if (c && state == DST_SHIFT_HR) {
-			if (c == ':') {
-				state = DST_SHIFT_MIN;
-				c = 0;
-			} else if (c == ',') {
-				state = START_MONTH;
-				c = 0;
-			} else if (dst_shift_hr == 1) dst_shift_hr = atoi(_posix.c_str() + strpos);
-		}			
-		if (c && state == DST_SHIFT_MIN) {
-			if (c == ',') {
-				state = START_MONTH;
-				c = 0;
-			} else if (!dst_shift_min) dst_shift_min = atoi(_posix.c_str() + strpos);
-		}			
-		if (c && state == START_MONTH) {
-			if (c == '.') {
-				state = START_WEEK;
-				c = 0;
-			} else if (c != 'M' && !start_month) start_month = atoi(_posix.c_str() + strpos);	
-		}			
-		if (c && state == START_WEEK) {
-			if (c == '.') {
-				state = START_DOW;
-				c = 0;
-			} else start_week = c - '0';
-		}		
-		if (c && state == START_DOW) {
-			if (c == '/') {
-				state = START_TIME_HR;
-				c = 0;
-			} else if (c == ',') {
-				state = END_MONTH;
-				c = 0;
-			} else start_dow = c - '0';				
-		}
-		if (c && state == START_TIME_HR) {
-			if (c == ':') {
-				state = START_TIME_MIN;
-				c = 0;
-			} else if (c == ',') {
-				state = END_MONTH;
-				c = 0;
-			} else if (start_time_hr == 2) start_time_hr = atoi(_posix.c_str() + strpos);
-		}		
-		if (c && state == START_TIME_MIN) {
-			if (c == ',') {
-				state = END_MONTH;
-				c = 0;
-			} else if (!start_time_min) start_time_min = atoi(_posix.c_str() + strpos);
-		}		
-		if (c && state == END_MONTH) {
-			if (c == '.') {
-				state = END_WEEK;
-				c = 0;
-			} else if (c != 'M') if (!end_month) end_month = atoi(_posix.c_str() + strpos);
-		}			
-		if (c && state == END_WEEK) {
-			if (c == '.') {
-				state = END_DOW;
-				c = 0;
-			} else end_week = c - '0';
-		}		
-		if (c && state == END_DOW) {
-			if (c == '/') {
-				state = END_TIME_HR;
-				c = 0;			
-			} else end_dow = c - '0';
-		}
-		if (c && state == END_TIME_HR) {
-			if (c == ':') {
-				state = END_TIME_MIN;
-				c = 0;
-			}  else if (end_time_hr == 2) end_time_hr = atoi(_posix.c_str() + strpos);
-		}		
-		if (c && state == END_TIME_MIN) {
-			if (!end_time_min) end_time_min = atoi(_posix.c_str() + strpos);
-		}
-		strpos++;
-	}	
-	
-	int16_t std_offset = (offset_hr < 0) ? offset_hr * 60 - offset_min : offset_hr * 60 + offset_min;
-	
-	tzname = _posix.substring(0, stdname_end + 1);	// Overwritten with dstname later if needed
-	if (!start_month) {
-		if (tzname == "UTC" && std_offset) tzname = "???";
+	tzname = _posix.substring(0, rule.stdname_end + 1);
+	if (!rule.has_dst) {
+		if (tzname == "UTC" && rule.std_offset) tzname = "???";
 		is_dst = false;
-		offset = std_offset;
+		offset = rule.std_offset;
 	} else {
-		int16_t dst_offset = std_offset - dst_shift_hr * 60 - dst_shift_min;
-		// to find the year
 		tmElements_t tm;
 		ezt::breakTime(t, tm);	
-		
-		// in local time
-		ezTime_t dst_start = ezt::makeOrdinalTime(start_time_hr, start_time_min, 0, start_week, start_dow + 1, start_month, tm.Year + 1970);
-		ezTime_t dst_end = ezt::makeOrdinalTime(end_time_hr, end_time_min, 0, end_week, end_dow + 1, end_month, tm.Year + 1970);
-		
+		ezTime_t dst_start;
+		ezTime_t dst_end;
+		computeDstTransitions(rule, tm.Year + 1970, dst_start, dst_end);
+
 		if (local_or_utc == UTC_TIME) {
-			dst_start += std_offset * 60LL;
-			dst_end += dst_offset * 60LL;
+			// already UTC
+		} else {
+			dst_start -= rule.std_offset * 60LL;
+			dst_end -= rule.dst_offset * 60LL;
 		}
 		
 		if (dst_end > dst_start) {
-			is_dst = (t >= dst_start && t < dst_end);		// northern hemisphere
+			is_dst = (t >= dst_start && t < dst_end);
 		} else {
-			is_dst = !(t >= dst_end && t < dst_start);		// southern hemisphere
+			is_dst = !(t >= dst_end && t < dst_start);
 		}
 
 		if (is_dst) {
-			offset = dst_offset;
-			tzname = _posix.substring(dstname_begin, dstname_end + 1);
+			offset = rule.dst_offset;
+			tzname = _posix.substring(rule.dstname_begin, rule.dstname_end + 1);
 		} else {
-			offset = std_offset;
+			offset = rule.std_offset;
 		}
 	}
 
@@ -1153,6 +1361,52 @@ ezTime_t Timezone::tzTime(ezTime_t t, ezLocalOrUTC_t local_or_utc, String &tznam
 
 String Timezone::getPosix() { return _posix; }
 
+bool Timezone::hasDST() {
+	ezPosixRule_t rule;
+	parsePosixRule(_posix, rule);
+	return rule.has_dst;
+}
+
+bool Timezone::nextDSTChange(ezTime_t &transition, ezTime_t from /* = TIME_NOW */, const ezLocalOrUTC_t local_or_utc /* = UTC_TIME */) {
+	ezPosixRule_t rule;
+	parsePosixRule(_posix, rule);
+	if (!rule.has_dst) {
+		triggerError(DATA_NOT_FOUND);
+		return false;
+	}
+
+	if (from == TIME_NOW) {
+		from = nowUTC();
+	}
+
+	tmElements_t tm;
+	ezt::breakTime(from, tm);
+	for (uint8_t delta = 0; delta < 3; delta++) {
+		ezTime_t dst_start_utc;
+		ezTime_t dst_end_utc;
+		computeDstTransitions(rule, tm.Year + 1970 + delta, dst_start_utc, dst_end_utc);
+
+		ezTime_t first = dst_start_utc;
+		ezTime_t second = dst_end_utc;
+		if (second < first) {
+			ezTime_t tmp = first;
+			first = second;
+			second = tmp;
+		}
+		if (first > from) {
+			transition = (local_or_utc == LOCAL_TIME) ? tzTime(first, UTC_TIME) : first;
+			return true;
+		}
+		if (second > from) {
+			transition = (local_or_utc == LOCAL_TIME) ? tzTime(second, UTC_TIME) : second;
+			return true;
+		}
+	}
+
+	triggerError(DATA_NOT_FOUND);
+	return false;
+}
+
 #ifdef EZTIME_NETWORK_ENABLE
 
 	void Timezone::setGeoLookupMode(const ezGeoLookupMode_t mode) {
@@ -1163,34 +1417,90 @@ String Timezone::getPosix() { return _posix; }
 		return _geo_lookup_mode;
 	}
 
-	bool ezt::getPublicIP(String &ip) {
-		EzTimeUdp udp;
-		unsigned long started;
-		if (!beginServerQuery(udp, F("GETIP"), started)) {
+	bool ezt::asyncBusy() {
+		return _server_async.status == ASYNC_PENDING;
+	}
+
+	ezAsyncStatus_t ezt::asyncStatus() {
+		return _server_async.status;
+	}
+
+	ezAsyncType_t ezt::asyncType() {
+		return _server_async.type;
+	}
+
+	void ezt::cancelAsync() {
+		_server_async.udp.stop();
+		clearServerAsyncBuffers();
+		_server_async.status = ASYNC_IDLE;
+		_server_async.type = ASYNC_NONE;
+		_server_async.phase = SERVER_PHASE_IDLE;
+		_server_async.started = 0;
+		_server_async.query = "";
+		_server_async.request_id = "";
+		_server_async.result = "";
+		_server_async.info_type = "";
+		_server_async.target = "";
+		_server_async.timezone = NULL;
+		_server_async.allow_ext_geoip_fallback = false;
+	}
+
+	String ezt::asyncResult() {
+		return _server_async.result;
+	}
+
+	static bool beginGenericAsyncRequest(const ezAsyncType_t type, const String &query, Timezone *timezone = NULL, const bool allow_ext_geoip_fallback = false) {
+		if (ezt::asyncBusy()) {
+			triggerError(ASYNC_BUSY);
 			return false;
 		}
 
-		if (!waitForServerPacket(udp, ip, started)) {
+		ezt::cancelAsync();
+		_server_async.type = type;
+		_server_async.status = ASYNC_PENDING;
+		_server_async.query = query;
+		_server_async.timezone = timezone;
+		_server_async.allow_ext_geoip_fallback = allow_ext_geoip_fallback;
+		_server_async.phase = (type == ASYNC_LIST) ? SERVER_PHASE_WAIT_LIST_CHALLENGE : SERVER_PHASE_WAIT_RESPONSE;
+
+		if (type == ASYNC_LIST) {
+			_server_async.request_id = nextRequestId();
+			_server_async.query += F("#rid=");
+			_server_async.query += _server_async.request_id;
+		}
+
+		if (!beginServerQueryNonBlocking(_server_async.udp, _server_async.query, _server_async.started)) {
+			ezt::cancelAsync();
 			return false;
 		}
 
-		udp.stop();
-		ip.trim();
-		if (!ip.length() || startsWithIgnoreCase(ip, F("ERROR "))) {
-			if (startsWithIgnoreCase(ip, F("ERROR "))) {
-				_server_error = ip.substring(6);
-				triggerError(SERVER_ERROR);
-			} else {
-				triggerError(DATA_NOT_FOUND);
-			}
-			return false;
-		}
-
+		_last_error = NO_ERROR;
+		_server_error = "";
 		return true;
 	}
 
-	bool Timezone::setLocation(const String location /* = "GeoIP" */) {
+	bool ezt::beginGetPublicIP() {
+		return beginGenericAsyncRequest(ASYNC_GETIP, F("GETIP"));
+	}
 
+	bool ezt::beginInfo(const String infotype, const String target /* = "" */) {
+		String normalized_type = trimCopy(infotype);
+		if (!normalized_type.length()) {
+			triggerError(INVALID_REQUEST);
+			return false;
+		}
+
+		String query = F("INFO ");
+		query += normalized_type;
+		String normalized_target = trimCopy(target);
+		if (normalized_target.length()) {
+			query += ' ';
+			query += normalized_target;
+		}
+		return beginGenericAsyncRequest(ASYNC_INFO, query);
+	}
+
+	bool Timezone::beginSetLocation(const String location /* = "GeoIP" */) {
 		info(F("Timezone lookup for: "));
 		info(location);
 		info(F(" ... "));
@@ -1217,108 +1527,375 @@ String Timezone::getPosix() { return _posix; }
 			query = F("EXT_GEOIP");
 		}
 
-		EzTimeUdp udp;
-		unsigned long started;
-		if (!beginServerQuery(udp, query, started)) {
-			return false;
-		}
+		return beginGenericAsyncRequest(ASYNC_SETLOCATION, query, this, allow_ext_geoip_fallback);
+	}
 
-		String recv;
-		recv.reserve(60);
-		if (!waitForServerPacket(udp, recv, started)) {
-			return false;
-		}
-		udp.stop();
-		info(F("(round-trip "));
-		info(millis() - started);
-		info(F(" ms)  "));
+	void ezt::pollAsync() {
+		if (_ntp_async.active && _ntp_async.phase == NTP_PHASE_WAIT_RESPONSE) {
+			if (_ntp_async.udp.parsePacket()) {
+				_ntp_async.udp.read(_ntp_async.buffer, NTP_PACKET_SIZE);
+				_ntp_async.udp.stop();
+				_ntp_async.active = false;
 
-		if (allow_ext_geoip_fallback && (recv == F("ERROR GEOIP Lookup Failed") || recv == F("ERROR GEOIP Internal IP"))) {
-			info(F("retrying with EXT_GEOIP ... "));
-			if (!beginServerQuery(udp, F("EXT_GEOIP"), started)) {
-				return false;
+				byte *buffer = _ntp_async.buffer;
+				uint32_t highWord = ( buffer[16] << 8 | buffer[17] ) & 0x0000FFFF;
+				uint32_t lowWord = ( buffer[18] << 8 | buffer[19] ) & 0x0000FFFF;
+				uint32_t reftsSec = highWord << 16 | lowWord;
+				highWord = ( buffer[32] << 8 | buffer[33] ) & 0x0000FFFF;
+				lowWord = ( buffer[34] << 8 | buffer[35] ) & 0x0000FFFF;
+				uint32_t rcvtsSec = highWord << 16 | lowWord;
+				highWord = ( buffer[40] << 8 | buffer[41] ) & 0x0000FFFF;
+				lowWord = ( buffer[42] << 8 | buffer[43] ) & 0x0000FFFF;
+				uint32_t secsSince1900 = highWord << 16 | lowWord;
+				highWord = ( buffer[44] << 8 | buffer[45] ) & 0x0000FFFF;
+				lowWord = ( buffer[46] << 8 | buffer[47] ) & 0x0000FFFF;
+				uint32_t fraction = highWord << 16 | lowWord;
+
+				if ((buffer[1] < 1) || (buffer[1] > 15) || (reftsSec == 0) || (rcvtsSec == 0) || (rcvtsSec > secsSince1900)) {
+					triggerError(INVALID_DATA);
+					UTC.setEvent(updateNTP, nowUTC(false) + NTP_RETRY);
+				} else {
+					ezTime_t t;
+					if (!ntpSecondsToUnixTime(secsSince1900, t)) {
+						triggerError(INVALID_DATA);
+						UTC.setEvent(updateNTP, nowUTC(false) + NTP_RETRY);
+					} else {
+						uint32_t done = millis();
+						uint16_t ms = fraction / 4294967UL;
+						unsigned long measured_at = done - ((done - _ntp_async.started) / 2) - ms;
+						int64_t correction = ((int64_t)(t - _last_sync_time) * 1000LL) - (int64_t)(measured_at - _last_sync_millis);
+						_last_sync_time = t;
+						_last_sync_millis = measured_at;
+						_last_read_ms = (millis() - measured_at) % 1000;
+						info(F("Received time: "));
+						info(UTC.dateTime(t, F("l, d-M-y H:i:s.v T")));
+						if (_time_status != timeNotSet) {
+							info(F(" (internal clock was "));
+							if (!correction) {
+								infoln(F("spot on)"));
+							} else {
+								info(int64ToString(correction < 0 ? -correction : correction));
+								infoln(correction > 0 ? F(" ms fast)") : F(" ms slow)"));
+							}
+						} else {
+							infoln("");
+						}
+						if (_ntp_interval) UTC.setEvent(updateNTP, t + _ntp_interval);
+						_time_status = timeSet;
+						_last_error = NO_ERROR;
+					}
+				}
+			} else if (millis() - _ntp_async.started > NTP_TIMEOUT) {
+				_ntp_async.udp.stop();
+				_ntp_async.active = false;
+				for (uint8_t next = _ntp_async.server_index + 1; next < 3; next++) {
+					String next_server = _ntp_servers[next];
+					next_server.trim();
+					if (next_server.length()) {
+						info(F("NTP query failed, trying fallback "));
+						info(next + 1);
+						info(F(": "));
+						infoln(next_server);
+						if (beginNtpAsyncRequest(next)) {
+							return;
+						}
+					}
+				}
+				triggerError(TIMEOUT);
+				if (nowUTC(false) > _last_sync_time + _ntp_interval + NTP_STALE_AFTER) {
+					_time_status = timeNeedsSync;
+				}
+				UTC.setEvent(updateNTP, nowUTC(false) + NTP_RETRY);
 			}
-			recv = "";
-			if (!waitForServerPacket(udp, recv, started)) {
-				return false;
-			}
-			udp.stop();
-			info(F("(round-trip "));
-			info(millis() - started);
-			info(F(" ms)  "));
 		}
 
-		if (recv.substring(0,6) == "ERROR ") {
-			_server_error = recv.substring(6);
-			triggerError(SERVER_ERROR);
+		if (_server_async.status != ASYNC_PENDING) {
+			return;
+		}
+
+		if (!_server_async.udp.parsePacket()) {
+			if (millis() - _server_async.started > TIMEZONED_TIMEOUT) {
+				triggerError(TIMEOUT);
+				_server_async.status = ASYNC_ERROR;
+				_server_async.udp.stop();
+				clearServerAsyncBuffers();
+			}
+			return;
+		}
+
+		String packet;
+		while (_server_async.udp.available()) {
+			packet += (char)_server_async.udp.read();
+		}
+		packet.trim();
+
+		if (_server_async.phase == SERVER_PHASE_WAIT_RESPONSE) {
+			if (startsWithIgnoreCase(packet, F("ERROR "))) {
+				_server_error = packet.substring(6);
+				triggerError(classifyServerError(_server_error));
+				if (_server_async.allow_ext_geoip_fallback && (_server_error == F("GEOIP Lookup Failed") || _server_error == F("GEOIP Internal IP"))) {
+					info(F("retrying with EXT_GEOIP ... "));
+					_server_async.allow_ext_geoip_fallback = false;
+					_server_async.query = F("EXT_GEOIP");
+					if (beginServerQueryNonBlocking(_server_async.udp, _server_async.query, _server_async.started)) {
+						return;
+					}
+				}
+				_server_async.status = ASYNC_ERROR;
+				_server_async.udp.stop();
+				return;
+			}
+
+			if (_server_async.type == ASYNC_INFO) {
+				if (!startsWithIgnoreCase(packet, F("INFO OK "))) {
+					triggerError(PROTOCOL_ERROR);
+					_server_async.status = ASYNC_ERROR;
+					_server_async.udp.stop();
+					return;
+				}
+				_server_async.result = packet.substring(8);
+				_server_async.status = ASYNC_SUCCESS;
+				_server_async.udp.stop();
+				return;
+			}
+
+			if (_server_async.type == ASYNC_SETLOCATION) {
+				if (!startsWithIgnoreCase(packet, F("OK "))) {
+					triggerError(PROTOCOL_ERROR);
+					_server_async.status = ASYNC_ERROR;
+					_server_async.udp.stop();
+					return;
+				}
+				int separator = packet.indexOf(' ', 3);
+				if (separator < 0) {
+					triggerError(PROTOCOL_ERROR);
+					_server_async.status = ASYNC_ERROR;
+					_server_async.udp.stop();
+					return;
+				}
+				String olson = packet.substring(3, separator);
+				String posix = packet.substring(separator + 1);
+				if (!_server_async.timezone || !_server_async.timezone->applyTimezoneData(olson, posix)) {
+					_server_async.status = ASYNC_ERROR;
+					_server_async.udp.stop();
+					return;
+				}
+				_server_async.result = olson;
+				_server_async.status = ASYNC_SUCCESS;
+				_server_async.udp.stop();
+				return;
+			}
+
+			_server_async.result = packet;
+			_server_async.status = ASYNC_SUCCESS;
+			_server_async.udp.stop();
+			return;
+		}
+
+		if (_server_async.phase == SERVER_PHASE_WAIT_LIST_CHALLENGE) {
+			if (startsWithIgnoreCase(packet, F("ERROR "))) {
+				_server_error = packet.substring(6);
+				triggerError(classifyServerError(_server_error));
+				_server_async.status = ASYNC_ERROR;
+				_server_async.udp.stop();
+				return;
+			}
+			if (!startsWithIgnoreCase(packet, F("LIST CHALLENGE "))) {
+				triggerError(CHALLENGE_FAILED);
+				_server_async.status = ASYNC_ERROR;
+				_server_async.udp.stop();
+				return;
+			}
+			String token = packet.substring(15);
+			token.trim();
+			String challenged_query = _server_async.query + F("&token=") + token;
+			if (!beginServerQueryNonBlocking(_server_async.udp, challenged_query, _server_async.started)) {
+				_server_async.status = ASYNC_ERROR;
+				return;
+			}
+			_server_async.phase = SERVER_PHASE_WAIT_LIST_CHUNKS;
+			return;
+		}
+
+		if (_server_async.phase == SERVER_PHASE_WAIT_LIST_CHUNKS) {
+			ezChunkPacket_t chunk_info;
+			if (!parseChunkPacket(packet, chunk_info)) {
+				triggerError(PROTOCOL_ERROR);
+				_server_async.status = ASYNC_ERROR;
+				_server_async.udp.stop();
+				return;
+			}
+			if (chunk_info.has_crc && crc32String(chunk_info.chunk) != chunk_info.crc) {
+				triggerError(CRC_ERROR);
+				_server_async.status = ASYNC_ERROR;
+				_server_async.udp.stop();
+				return;
+			}
+			if (!validateChunkPacket(chunk_info, _server_async.request_id)) {
+				triggerError(CHUNK_ERROR);
+				_server_async.status = ASYNC_ERROR;
+				_server_async.udp.stop();
+				return;
+			}
+
+			if (_server_async.chunks == NULL) {
+				_server_async.total_chunks = chunk_info.total;
+				_server_async.chunks = new String[_server_async.total_chunks];
+				_server_async.received = new bool[_server_async.total_chunks];
+				if (_server_async.chunks == NULL || _server_async.received == NULL) {
+					triggerError(CONNECT_FAILED);
+					_server_async.status = ASYNC_ERROR;
+					_server_async.udp.stop();
+					clearServerAsyncBuffers();
+					return;
+				}
+				for (uint16_t i = 0; i < _server_async.total_chunks; i++) {
+					_server_async.received[i] = false;
+				}
+			} else if (chunk_info.total != _server_async.total_chunks) {
+				triggerError(CHUNK_ERROR);
+				_server_async.status = ASYNC_ERROR;
+				_server_async.udp.stop();
+				clearServerAsyncBuffers();
+				return;
+			}
+
+			if (!_server_async.received[chunk_info.index - 1]) {
+				_server_async.chunks[chunk_info.index - 1] = chunk_info.chunk;
+				_server_async.received[chunk_info.index - 1] = true;
+				_server_async.received_count++;
+			}
+
+			if (_server_async.received_count >= _server_async.total_chunks) {
+				_server_async.result = "";
+				for (uint16_t i = 0; i < _server_async.total_chunks; i++) {
+					_server_async.result += _server_async.chunks[i];
+				}
+				_server_async.status = ASYNC_SUCCESS;
+				_server_async.udp.stop();
+				clearServerAsyncBuffers();
+			}
+		}
+	}
+
+	bool ezt::getPublicIP(String &ip) {
+		if (!beginGetPublicIP()) {
 			return false;
 		}
-		if (recv.substring(0,3) == "OK ") {
-			_olson = recv.substring(3, recv.indexOf(" ", 4));
-			_posix = recv.substring(recv.indexOf(" ", 4) + 1);
-			infoln(F("success."));
-			info(F("  Olson: ")); infoln(_olson);
-			info(F("  Posix: ")); infoln(_posix);
-			#if defined(EZTIME_CACHE_EEPROM) || defined(EZTIME_CACHE_NVS)
-				String tzinfo = _olson + " " + _posix;
-				writeCache(tzinfo);		// caution, byref to save memory, tzinfo mangled afterwards
-			#endif
-			return true;
+		while (asyncStatus() == ASYNC_PENDING) {
+			pollAsync();
+			delay(1);
 		}
-		triggerError(DATA_NOT_FOUND);
+		if (asyncStatus() != ASYNC_SUCCESS) {
+			return false;
+		}
+		ip = asyncResult();
+		ip.trim();
+		if (!ip.length() || startsWithIgnoreCase(ip, F("ERROR "))) {
+			if (startsWithIgnoreCase(ip, F("ERROR "))) {
+				_server_error = ip.substring(6);
+				triggerError(classifyServerError(_server_error));
+			} else {
+				triggerError(DATA_NOT_FOUND);
+			}
+			return false;
+		}
+
+		return true;
+	}
+
+	bool ezt::getInfo(const String infotype, String &value, const String target /* = "" */) {
+		if (!beginInfo(infotype, target)) {
+			return false;
+		}
+		while (asyncStatus() == ASYNC_PENDING) {
+			pollAsync();
+			delay(1);
+		}
+		if (asyncStatus() != ASYNC_SUCCESS) {
+			return false;
+		}
+		value = asyncResult();
+		if (trimCopy(infotype).equalsIgnoreCase(F("all")) && startsWithIgnoreCase(value, F("all"))) {
+			value = value.substring(3);
+			value.trim();
+		}
+		return true;
+	}
+
+	bool ezt::getInfoAll(String &info_data, const String target /* = "" */) {
+		return getInfo(F("all"), info_data, target);
+	}
+
+	bool ezt::infoItem(const String &info_data, const String &key, String &value) {
+		String key_lc = key;
+		key_lc.trim();
+		key_lc.toLowerCase();
+
+		int start = 0;
+		while (start < info_data.length()) {
+			int end = info_data.indexOf(';', start);
+			if (end < 0) end = info_data.length();
+			String entry = info_data.substring(start, end);
+			entry.trim();
+			if (entry.length()) {
+				int separator = entry.indexOf(':');
+				if (separator > 0) {
+					String current_key = entry.substring(0, separator);
+					current_key.trim();
+					current_key.toLowerCase();
+					if (current_key == key_lc) {
+						value = entry.substring(separator + 1);
+						value.trim();
+						return true;
+					}
+				}
+			}
+			start = end + 1;
+			while (start < info_data.length() && (info_data[start] == '\n' || info_data[start] == '\r')) {
+				start++;
+			}
+		}
 		return false;
+	}
+
+	bool Timezone::setLocation(const String location /* = "GeoIP" */) {
+		if (!beginSetLocation(location)) {
+			return false;
+		}
+		while (ezt::asyncStatus() == ASYNC_PENDING) {
+			ezt::pollAsync();
+			delay(1);
+		}
+		return ezt::asyncStatus() == ASYNC_SUCCESS;
 	}
 
 	#ifdef EZTIME_SERVER_LIST_ENABLE
 
-		bool ezt::listTimezones(const String list_name, String &list_data) {
+		bool ezt::beginListTimezones(const String list_name) {
 			String normalized = trimCopy(list_name);
 			normalized.toLowerCase();
 			if (!normalized.length()) {
 				triggerError(DATA_NOT_FOUND);
 				return false;
 			}
+			String query = F("LIST ");
+			query += normalized;
+			return beginGenericAsyncRequest(ASYNC_LIST, query);
+		}
 
-			String request_id = nextRequestId();
-			String initial_query = F("LIST ");
-			initial_query += normalized;
-			initial_query += F("#rid=");
-			initial_query += request_id;
-
-			EzTimeUdp udp;
-			unsigned long started;
-			if (!beginServerQuery(udp, initial_query, started)) {
+		bool ezt::listTimezones(const String list_name, String &list_data) {
+			if (!beginListTimezones(list_name)) {
 				return false;
 			}
-
-			String response;
-			if (!waitForServerPacket(udp, response, started)) {
+			while (asyncStatus() == ASYNC_PENDING) {
+				pollAsync();
+				delay(1);
+			}
+			if (asyncStatus() != ASYNC_SUCCESS) {
 				return false;
 			}
-			udp.stop();
-
-			if (!startsWithIgnoreCase(response, F("LIST CHALLENGE "))) {
-				if (startsWithIgnoreCase(response, F("ERROR "))) {
-					_server_error = response.substring(6);
-					triggerError(SERVER_ERROR);
-				} else {
-					triggerError(INVALID_DATA);
-				}
-				return false;
-			}
-
-			String token = response.substring(15);
-			token.trim();
-			String challenged_query = initial_query + F("&token=") + token;
-			if (!beginServerQuery(udp, challenged_query, started)) {
-				return false;
-			}
-
-			list_data = "";
-			if (!receiveChunkedResponse(udp, request_id, list_data, started)) {
-				return false;
-			}
-
+			list_data = asyncResult();
 			return true;
 		}
 
@@ -1375,7 +1952,29 @@ String Timezone::getPosix() { return _posix; }
 
 	String Timezone::getOlsen() {
 		return _olson;
-	}	
+	}
+
+	bool Timezone::applyTimezoneData(const String &olson, const String &posix, const bool write_cache /* = true */) {
+		if (_locked_to_UTC) {
+			triggerError(LOCKED_TO_UTC);
+			return false;
+		}
+
+		_olson = olson;
+		_posix = posix;
+		infoln(F("success."));
+		info(F("  Olson: ")); infoln(_olson);
+		info(F("  Posix: ")); infoln(_posix);
+		#if defined(EZTIME_CACHE_EEPROM) || defined(EZTIME_CACHE_NVS)
+			if (write_cache) {
+				String tzinfo = _olson + " " + _posix;
+				this->writeCache(tzinfo);
+			}
+		#else
+			(void)write_cache;
+		#endif
+		return true;
+	}
 
 
 	#if defined(EZTIME_CACHE_EEPROM) || defined(EZTIME_CACHE_NVS)
@@ -1412,8 +2011,7 @@ String Timezone::getPosix() { return _posix; }
 			String olson, posix;
 			uint8_t months_since_jan_2018;
 			if (readCache(olson, posix, months_since_jan_2018)) {
-				setPosix(posix);
-				_olson = olson;
+				applyTimezoneData(olson, posix, false);
 				_cache_month = months_since_jan_2018;
 				if ( (year() - 2018) * 12 + month(LAST_READ) - months_since_jan_2018 > MAX_CACHE_AGE_MONTHS) {
 					infoln(F("Cache stale, getting fresh"));

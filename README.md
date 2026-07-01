@@ -223,6 +223,16 @@ What usually stays the same:
 - Existing timezone logic and formatting code
 - Most code that used ezTime as a drop-in style Arduino time library extension
 
+Breaking changes and behavior differences you should actively review:
+
+- `#include <ezTime.h>` is no longer supported. Use `#include <ezTime2.h>`.
+- Compile-time overrides should now go into `ezTime2Config.h` or global build flags. A plain `#define` that only exists in the sketch is no longer the recommended way to change library internals.
+- On modern non-AVR boards, `ezTime2` now defaults to 64-bit `ezTime_t`. Sketches that store timestamps in plain `time_t`, `long`, or `uint32_t` can still truncate values even if the library itself is fine.
+- The default timezone cache backend changed on `ESP32`: `ezTime2` now uses `NVS` by default instead of EEPROM-style storage.
+- The bundled timezone service target is now `timezoned.circuitflow.eu`, not the old ezTime service.
+- `LIST`, `GETIP`, `EXT_GEOIP`, and `INFO` are now first-class optional client features. If your old code had custom raw UDP helpers for these, it should be migrated to the built-in helpers.
+- There is intentionally no compatibility wrapper header named `ezTime.h`, so having both libraries installed side by side does not silently pick the wrong one.
+
 What you should review:
 
 - If you had both `ezTime` and `ezTime2` installed locally, make sure the sketch now includes `ezTime2.h`
@@ -233,10 +243,14 @@ What you should review:
 Recommended migration checklist:
 
 1. Change `#include <ezTime.h>` to `#include <ezTime2.h>`.
-2. Rebuild the sketch and fix any direct references to old local library paths if you had custom includes.
-3. If your sketch stores timestamps in plain `time_t`, consider switching those variables to `ezTime_t`.
-4. If you want public-IP fallback for timezone lookup, enable `EZTIME_EXT_GEOIP_FALLBACK` or call `setGeoLookupMode(...)`.
-5. If you want UI-oriented timezone lists on stronger boards, enable `EZTIME_SERVER_LIST_ENABLE` and use `listTimezones(...)`.
+2. If you had edited the old library headers directly, move those compile-time changes into `ezTime2Config.h`.
+3. Rebuild the sketch and fix any direct references to old local library paths if you had custom includes.
+4. If your sketch stores timestamps in plain `time_t`, `long`, or `uint32_t`, consider switching those variables to `ezTime_t`.
+5. If your project runs on `ESP32` and used EEPROM cache assumptions, review the cache backend and either accept the new `NVS` default or override it explicitly.
+6. If you want public-IP fallback for timezone lookup, enable `EZTIME_EXT_GEOIP_FALLBACK` or call `setGeoLookupMode(...)`.
+7. If you want UI-oriented timezone lists on stronger boards, enable `EZTIME_SERVER_LIST_ENABLE` and use `listTimezones(...)`.
+8. If you want server-side metadata such as current UTC offset, DST state, city, or epoch, use the new `getInfo(...)` helpers instead of custom protocol parsing.
+9. If you need a fully responsive loop, migrate blocking server calls to the new async helpers such as `beginInfo(...)`, `beginSetLocation(...)`, and `beginListTimezones(...)`.
 
 # &nbsp;
 
@@ -313,6 +327,9 @@ The following options are meant to be set in `ezTime2Config.h` or passed as glob
 // Disable all networking code entirely.
 // #define EZTIME_NETWORK_DISABLE
 
+// Compile out timezone caching entirely.
+// #define EZTIME_CACHE_DISABLE
+
 // Force timestamp width.
 // #define EZTIME_FORCE_32BIT_TIME
 // #define EZTIME_FORCE_64BIT_TIME
@@ -353,9 +370,9 @@ Rules:
 - `NTP_SERVER` defaults to `pool.ntp.org`.
 - `NTP_SERVER_2` and `NTP_SERVER_3` default to empty strings and are ignored unless set.
 - `EZTIME_FORCE_32BIT_TIME` and `EZTIME_FORCE_64BIT_TIME` are mutually exclusive.
-- `EZTIME_CACHE_EEPROM` and `EZTIME_CACHE_NVS` are mutually exclusive.
+- `EZTIME_CACHE_DISABLE`, `EZTIME_CACHE_EEPROM`, and `EZTIME_CACHE_NVS` are mutually exclusive.
 - `EZTIME_SERVER_LIST_ENABLE` and `EZTIME_SERVER_LIST_DISABLE` are mutually exclusive.
-- If you do not override the cache backend, ezTime2 defaults to `NVS` on `ESP32` and `EEPROM` elsewhere.
+- If you do not disable or override the cache backend, ezTime2 defaults to `NVS` on `ESP32` and `EEPROM` elsewhere.
 - If you do not override LIST support, ezTime2 auto-enables it on `ESP32` and leaves it off elsewhere.
 - If you define nothing, the library uses its normal defaults and behaves like a plain install.
 
@@ -391,6 +408,14 @@ For no-network builds you can disable all NTP and timezone server support with a
 // ezTime2Config.h
 #define EZTIME_NETWORK_DISABLE
 ```
+
+If you want timezone caching gone completely, use:
+
+```cpp
+#define EZTIME_CACHE_DISABLE
+```
+
+That removes the cache backend code from the build instead of merely leaving it unused at runtime.
 
 ```cpp
 // sketch.ino
@@ -549,6 +574,24 @@ is enough, because the time in India doesn't go back and forth with the coming a
 
 Tells you whether DST is in effect at a given time in this timezone. If you do not provide arguments, it's interpreted as 'right now'. You can also specify a time (in seconds since 1970, we'll get back to that) in the first argument. If you want to know a certain time in UTC in within the DST windown in a given timezone you can set the second argument to `false`, otherwise it is assumed you are asking about a time expressed as local time.
 
+`bool hasDST();`
+
+Returns whether the loaded POSIX rule for this timezone contains any daylight-saving transitions at all.
+
+`bool nextDSTChange(ezTime_t &transition, ezTime_t from = TIME_NOW, ezLocalOrUTC_t mode = UTC_TIME);`
+
+Calculates the next DST transition locally from the currently loaded POSIX rule. No internet access is required once the timezone has been loaded. `transition` receives the next transition time. Use `UTC_TIME` if you want the returned timestamp in UTC, or `LOCAL_TIME` if you want the returned timestamp converted into the timezone's local wall clock.
+
+Example:
+
+```cpp
+ezTime_t nextChange;
+
+if (Berlin.nextDSTChange(nextChange, TIME_NOW, UTC_TIME)) {
+  Serial.println(UTC.dateTime(nextChange, "Y-m-d H:i:s T"));
+}
+```
+
 &nbsp;
 
 ### getTimezoneName
@@ -585,6 +628,18 @@ myTZ.setGeoLookupMode(GEOIP_LOOKUP_WITH_EXT_FALLBACK);
 
 That setting only affects automatic GeoIP-style lookups. Explicit timezone strings such as `Europe/Berlin` or country codes such as `DE` still work as before. Passing `"EXT_GEOIP"` explicitly to `setLocation` is also supported.
 
+If you want to inspect or display the public IP that the server sees before doing your own timezone logic, use [`getPublicIP`](#getpublicip). That is the manual client-side wrapper for the server's `GETIP` feature.
+
+If you want the same lookup path without blocking your loop, use:
+
+```cpp
+myTZ.beginSetLocation("Europe/Berlin");
+
+while (ezt::asyncStatus() == ASYNC_PENDING) {
+  ezt::events();
+}
+```
+
 In the case of `SERVER_ERROR`, `errorString()` returns the error from the server, which might be "Country Spans Multiple Timezones", "Country Not Found", "GeoIP Lookup Failed" or "Timezone Not Found".
 
 If you execute multiple calls to `setLocation`, make sure they are more than 3 seconds apart, because the server will not answer if calls from the same IP come within 3 seconds of one another (see below).
@@ -595,7 +650,130 @@ If you execute multiple calls to `setLocation`, make sure they are more than 3 s
 
 `bool getPublicIP(String &ip);`
 
-This asks the timezone server which public IP address it sees for the client and writes that into `ip`. It is useful if you want to inspect what the server-side `EXT_GEOIP` path would actually see after NAT.
+This sends a `GETIP` request to `timezoned.circuitflow.eu`, asks which public IP address the server sees for the client, and writes that into `ip`.
+
+This is useful when:
+
+- you want to show the detected public IP in a UI or debug log
+- you want to understand what `EXT_GEOIP` would see after NAT or carrier-grade NAT
+- you want to decide in your own code whether to do a normal `GEOIP`, an explicit `EXT_GEOIP`, or some other custom flow
+
+Example:
+
+```cpp
+String publicIP;
+
+if (ezt::getPublicIP(publicIP)) {
+  Serial.print(F("Public IP: "));
+  Serial.println(publicIP);
+} else {
+  Serial.print(F("GETIP failed: "));
+  Serial.println(ezt::errorString());
+}
+```
+
+If you want to use that result to trigger an explicit external lookup, you can still call:
+
+```cpp
+Timezone myTZ;
+
+if (ezt::getPublicIP(publicIP)) {
+  Serial.print(F("Server sees: "));
+  Serial.println(publicIP);
+}
+
+if (myTZ.setLocation("EXT_GEOIP")) {
+  Serial.println(myTZ.getOlson());
+} else {
+  Serial.println(ezt::errorString());
+}
+```
+
+`getPublicIP` returns `true` on success. On failure it returns `false` and sets the normal ezTime error state such as `NO_NETWORK`, `TIMEOUT`, or `SERVER_ERROR`.
+
+Like other server-backed lookups, `GETIP` is rate-limited server-side. If you are doing repeated manual requests, do not hammer it in a tight loop.
+
+&nbsp;
+
+### INFO Queries
+
+`bool getInfo(String infotype, String &value, String target = "");`
+
+`bool getInfoAll(String &info_data, String target = "");`
+
+`bool infoItem(String info_data, String key, String &value);`
+
+The server can return extra timezone metadata through `INFO`. This is useful when you want more than just `OK <olson> <posix>`, for example:
+
+- the current UTC offset
+- whether the timezone has DST at all
+- whether it is currently in DST
+- date, day, time, city, country code, epoch
+
+Examples:
+
+```cpp
+String offset;
+if (ezt::getInfo("utcoffset", offset, "Europe/Berlin")) {
+  Serial.println(offset);  // +02:00
+}
+```
+
+```cpp
+String infoAll;
+if (ezt::getInfoAll(infoAll, "Europe/Berlin")) {
+  String city;
+  if (ezt::infoItem(infoAll, "city", city)) {
+    Serial.println(city);
+  }
+}
+```
+
+`getInfoAll` returns the server's compact `key:value;` payload. `infoItem` lets you pull out just one field without writing your own parser.
+
+Like the other helpers, the synchronous `getInfo` and `getInfoAll` wrappers block until the response arrives. If you want to keep your loop responsive, use `beginInfo(...)` together with the async polling helpers below.
+
+&nbsp;
+
+### Async Server Requests
+
+`bool beginInfo(String infotype, String target = "");`
+
+`bool beginGetPublicIP();`
+
+`bool beginListTimezones(String list_name);`
+
+`bool Timezone::beginSetLocation(String location = "GeoIP");`
+
+`void pollAsync();`
+
+`ezAsyncStatus_t asyncStatus();`
+
+`bool asyncBusy();`
+
+`String asyncResult();`
+
+ezTime2 now has a small non-blocking request path for server-backed features. Start one request, keep calling `events()` or `pollAsync()`, and then inspect `asyncStatus()`.
+
+Example:
+
+```cpp
+if (ezt::beginInfo("epoch", "Europe/Berlin")) {
+  while (ezt::asyncStatus() == ASYNC_PENDING) {
+    ezt::events();
+  }
+
+  if (ezt::asyncStatus() == ASYNC_SUCCESS) {
+    Serial.println(ezt::asyncResult());
+  } else {
+    Serial.println(ezt::errorString());
+  }
+}
+```
+
+Only one async server request can be active at a time. Starting a second one before the first has finished returns `ASYNC_BUSY`.
+
+`events()` also progresses the background NTP sync path, so regular time updates no longer have to block your sketch while waiting for the reply.
 
 &nbsp;
 
@@ -607,7 +785,35 @@ This asks the timezone server which public IP address it sees for the client and
 
 `bool listItem(String list_data, uint16_t item_index, String &name, uint16_t &child_count);`
 
-These helpers wrap the server's `LIST` protocol for UI-style timezone pickers. They are only compiled when `EZTIME_SERVER_LIST_ENABLE` is active. `listTimezones("regions", data)` gives you the top-level regions. For entries that have subregions, `child_count` will be greater than zero and you can then request another list such as `"america"`.
+These helpers wrap the server's `LIST` protocol for UI-style timezone pickers. They are only compiled when `EZTIME_SERVER_LIST_ENABLE` is active.
+
+The hierarchy works like this:
+
+- `listTimezones("regions", data)` always returns the top-level Olson regions such as `Europe`, `America`, `Asia`, and `Pacific`
+- every entry in that top-level `regions` list is itself a region you can request next, so selecting `Europe` means your next request is `listTimezones("europe", data)`
+- the final Olson timezone is built by joining the selected path segments with `/`
+- some paths are only two segments deep, for example `Europe/Berlin`
+- some paths are three segments deep, for example `America/Argentina/Buenos_Aires`
+
+That means `child_count` does not mean "this region has children but that one might not". At the top level you should treat each returned item as a selectable region. `child_count` tells you how many entries the next list level contains, and on deeper levels it tells you whether another list step exists below the current item.
+
+Typical flow:
+
+1. call `listTimezones("regions", regions)`
+2. user selects `Europe`
+3. call `listTimezones("europe", europeCities)`
+4. user selects `Berlin`
+5. build `Europe/Berlin`
+
+Or for a three-part Olson name:
+
+1. call `listTimezones("regions", regions)`
+2. user selects `America`
+3. call `listTimezones("america", americaEntries)`
+4. user selects `Argentina`
+5. call `listTimezones("argentina", argentinaEntries)`
+6. user selects `Buenos_Aires`
+7. build `America/Argentina/Buenos_Aires`
 
 The raw `list_data` is kept as a compact semicolon-delimited string so the library does not have to allocate large in-memory tables for you. `listLength` tells you how many entries are present and `listItem` lets you walk that list one item at a time.
 
@@ -621,7 +827,9 @@ The service has the potential of seeing which IP-numbers use ezTime and what tim
 
 Data has never been used for any other purposes than debugging, nor is any other use envisioned in the future.
 
-The code for the timezoned server is included in the server directory of the library repository, in case someone wnats to know how that works or insists on running a timezone information server themselves. Be aware that it is a bit of an ugly hack at the time of writing this... 
+The code for the `timezoned` server is included in the [`server`](/Users/christopherleber/Documents/Projekte/Arduino/ezTime2/server) directory of this repository. That makes it easier to understand the protocol, audit the implementation, or run your own compatible server if you want full control over the backend.
+
+What started as the original ezTime server has been reworked substantially in ezTime2. It now has a cleaner protocol surface, better list handling, updated timezone data handling, and more deliberate operational safeguards than the old service.
 
 &nbsp;
 
@@ -1201,7 +1409,12 @@ ezTime 0.7.2 runs fine (No networking on board, so tested with NoNetwork example
 | [**`error`**](#error) | `ezError_t` | `bool reset = false` | no | no | no
 | [**`errorString`**](#errorstring) | `String` | `ezError_t err = LAST_ERROR` | no | no | no
 | [**`events`**](#events) | `void` | | no | no | no
+| [**`beginGetPublicIP`**](#async-server-requests) | `bool` | | no | yes | no
+| [**`beginInfo`**](#async-server-requests) | `bool` | `String infotype`, `String target = ""` | no | yes | no
+| [**`beginListTimezones`**](#async-server-requests) | `bool` | `String list_name` | no | yes | no
 | [**`getOffset`**](#getoffset) | `int16_t` | `TIME` | optional | no | no
+| [**`getInfo`**](#info-queries) | `bool` | `String infotype`, `String &value`, `String target = ""` | no | yes | no
+| [**`getInfoAll`**](#info-queries) | `bool` | `String &info_data`, `String target = ""` | no | yes | no
 | [**`getPublicIP`**](#getpublicip) | `bool` | `String &ip` | no | yes | no
 | **function** | **returns** | **arguments** | **TZ prefix** | **network** | **cache** |
 | [**`getOlson`**](#getolson) | `String` | | optional | yes | yes |
@@ -1212,6 +1425,7 @@ ezTime 0.7.2 runs fine (No networking on board, so tested with NoNetwork example
 | [**`isAM`**](#time-and-date-as-numbers) | `bool` | `TIME` | optional | no | no
 | [**`isDST`**](#isdst) | `bool` | `TIME` | optional | no | no
 | [**`isPM`**](#time-and-date-as-numbers) | `bool` | `TIME` | optional | no | no
+| [**`hasDST`**](#isdst) | `bool` | | yes | no | no
 | [**`lastNtpUpdateTime`](#lastNtpUpdateTime) | `ezTime_t` | | no | yes | no 
 | [**`listItem`**](#listtimezones) | `bool` | `String list_data`, `uint16_t item_index`, `String &name`, `uint16_t &child_count` | no | no | no
 | [**`listLength`**](#listtimezones) | `uint16_t` | `String list_data` | no | no | no
@@ -1227,7 +1441,12 @@ ezTime 0.7.2 runs fine (No networking on board, so tested with NoNetwork example
 | [**`monthShortStr`**](#names-of-days-and-months) | `String` | `uint8_t month` | no | no | no
 | [**`monthStr`**](#names-of-days-and-months) | `String` | `uint8_t month` | no | no | no
 | [**`ms`**](#time-and-date-as-numbers) | `uint16_t` | `TIME_NOW` or `LAST_READ` | optional | no | no
+| [**`nextDSTChange`**](#isdst) | `bool` | `ezTime_t &transition`, `ezTime_t from = TIME_NOW`, `ezLocalOrUTC_t mode = UTC_TIME` | yes | no | no
 | [**`now`**](#time-and-date-as-numbers) | `ezTime_t` | | optional | no | no
+| [**`asyncBusy`**](#async-server-requests) | `bool` | | no | yes | no
+| [**`asyncResult`**](#async-server-requests) | `String` | | no | yes | no
+| [**`asyncStatus`**](#async-server-requests) | `ezAsyncStatus_t` | | no | yes | no
+| [**`pollAsync`**](#async-server-requests) | `void` | | no | yes | no
 | [**`queryNTP`**](#queryntp) | `bool` | `String server`, `ezTime_t &t`, `unsigned long &measured_at` | no | yes | no
 | [**`second`**](#time-and-date-as-numbers) | `uint8_t` | `TIME` | optional | no | no
 | [**`secondChanged`**](#secondchanged-and-minutechanged) | `bool` | | no | no | no
@@ -1241,6 +1460,7 @@ ezTime 0.7.2 runs fine (No networking on board, so tested with NoNetwork example
 | [**`setInterval`**](#setserver-and-setinterval) | `void` | `uint16_t seconds = 0` |  | yes | no
 | **function** | **returns** | **arguments** | **TZ prefix** | **network** | **cache** |
 | [**`setGeoLookupMode`**](#setlocation) | `void` | `ezGeoLookupMode_t mode` | yes | no | no
+| [**`beginSetLocation`**](#setlocation) | `bool` | `String location = "GeoIP"` | yes | yes | no
 | [**`setLocation`**](#setlocation) | `bool` | `String location = ""` | yes | yes | no
 | [**`setPosix`**](#setposix) | `bool` | `String posix` | yes | yes | no
 | [**`setServer`**](#setserver-and-setinterval) | `void` | `String ntp_server = NTP_SERVER` | no | yes | no

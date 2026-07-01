@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.0 / timezoned 3.0.4 - 2026-07-01
+
+- added client-side `INFO` helpers with both synchronous and non-blocking request paths
+- added local DST introspection with `hasDST()` and `nextDSTChange(...)`
+- moved background NTP syncing onto the event-driven non-blocking path
+- added finer client error classes for rate limits, protocol errors, challenge failures, chunk failures, CRC failures, and async-busy states
+- added `EZTIME_CACHE_DISABLE` so cache code can be compiled out completely
+- expanded the full self-test with async, INFO, DST transition, staged-summary, and retry coverage
+- clarified migration and configuration documentation, including the new async and INFO APIs
+- corrected `LIST` hierarchy documentation and examples to describe Olson path building properly
+- improved example diagnostics so WiFi and sync failures are visible instead of failing silently
+- changed server log timestamps to explicit local time with timezone name and offset instead of a misleading hard-coded `Z`
+
 ## 1.0.0 / timezoned 3.0.3 - 2026-07-01
 
 - renamed the internal library sources to `ezTime2.h` and `ezTime2.cpp`
